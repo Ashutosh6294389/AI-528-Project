@@ -1,47 +1,39 @@
-category_map = {
-    "1": "Film & Animation",
-    "2": "Autos & Vehicles",
-    "10": "Music",
-    "15": "Pets & Animals",
-    "17": "Sports",
-    "18": "Short Movies",
-    "19": "Travel & Events",
-    "20": "Gaming",
-    "21": "Videoblogging",
-    "22": "People & Blogs",
-    "23": "Comedy",
-    "24": "Entertainment",
-    "25": "News & Politics",
-    "26": "Howto & Style",
-    "27": "Education",
-    "28": "Science & Technology",
-    "29": "Nonprofits & Activism"
-}
-
-import streamlit as st
 import os
+import sys
+from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import altair as alt
 import pandas as pd
-import time
+import streamlit as st
 from pyspark.sql import SparkSession
 
-st.set_page_config(page_title="YouTube Analytics", layout="wide")
-
-st.title("📊 YouTube Analytics Dashboard")
+from analytics.business_analysis import (
+    prepare_dashboard_df,
+    build_category_summary,
+    build_top_videos,
+    build_diagnostic_table,
+    build_forecast,
+    build_recommendations,
+)
 
 
 DELTA_PATH = "storage/delta_tables/youtube"
 
-# -------------------------------
-# Load Data from Delta Lake
-# -------------------------------
+st.set_page_config(page_title="Business-Ready YouTube Analytics", layout="wide")
+st.title("YouTube Business Analytics Dashboard")
+st.caption("Descriptive, diagnostic, predictive, and prescriptive analytics for trending YouTube content")
+
 @st.cache_resource(show_spinner=False)
 def get_spark():
-    return SparkSession.builder \
-        .appName("YouTubeAnalyticsDashboard") \
-        .master("local[*]") \
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+    return (
+        SparkSession.builder.appName("YouTubeAnalyticsDashboard")
+        .master("local[*]")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config(
             "spark.jars",
             "jars/delta-core_2.12-2.4.0.jar,"
@@ -49,185 +41,148 @@ def get_spark():
             "jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,"
             "jars/spark-token-provider-kafka-0-10_2.12-3.4.1.jar,"
             "jars/kafka-clients-3.4.1.jar,"
-            "jars/commons-pool2-2.11.1.jar"
-        )\
+            "jars/commons-pool2-2.11.1.jar",
+        )
         .getOrCreate()
+    )
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_data():
     try:
-        spark = get_spark()
         if not os.path.exists(DELTA_PATH):
             return pd.DataFrame()
+
+        spark = get_spark()
         sdf = spark.read.format("delta").load(DELTA_PATH)
+
         if sdf.rdd.isEmpty():
             return pd.DataFrame()
+
         return sdf.toPandas()
-    except Exception as e:
-        st.error(f"Error loading Delta table: {e}")
+    except Exception as exc:
+        st.error(f"Could not load Delta data: {exc}")
         return pd.DataFrame()
 
-df = load_data()
+raw_df = load_data()
+df = prepare_dashboard_df(raw_df)
 
-# -------------------------------
-# If no data
-# -------------------------------
 if df.empty:
-    st.warning("⚠️ No data available yet. Please run Spark streaming.")
-else:
-    for col in ["views", "likes", "comments"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    st.warning("No data available. Run the producer and Spark streaming first.")
+    st.stop()
 
-    # Engagement Ratio
-    df["engagement"] = df["likes"] / df["views"]
+st.sidebar.header("Filters")
 
-    # -------------------------------
-    # Sidebar
-    # -------------------------------
-    st.sidebar.header("Filters")
-    # Map all categories to readable names for the filter
-    sidebar_categories = []
-    for cat in df["category"].dropna().unique():
-        cat_str = str(cat).strip()
-        cat_str = category_map.get(cat_str, cat_str)
-        if cat_str.lower() not in ["nan", "none", ""] and cat_str not in sidebar_categories:
-            sidebar_categories.append(cat_str)
-    selected_category = st.sidebar.selectbox("Select Category", ["All"] + sidebar_categories)
+category_options = ["All"] + sorted(df["category"].dropna().astype(str).unique().tolist())
+region_options = ["All"] + sorted(df["region"].dropna().astype(str).unique().tolist())
 
-    if selected_category != "All":
-        mapped_cats = df["category"].apply(lambda x: category_map.get(str(x).strip(), str(x).strip()))
-        df = df[mapped_cats == selected_category]
+selected_category = st.sidebar.selectbox("Category", category_options)
+selected_region = st.sidebar.selectbox("Region", region_options)
 
-    # -------------------------------
-    # Metrics
-    # -------------------------------
-    st.subheader("📌 Key Metrics")
-    col1, col2, col3 = st.columns(3)
+if selected_category != "All":
+    df = df[df["category"] == selected_category]
 
-    col1.metric("Total Views", int(df["views"].sum()))
-    col2.metric("Total Likes", int(df["likes"].sum()))
-    col3.metric("Total Comments", int(df["comments"].sum()))
+if selected_region != "All":
+    df = df[df["region"] == selected_region]
 
-    # -------------------------------
-    # Charts (FIXED)
-    # -------------------------------
+if df.empty:
+    st.warning("No data matched the selected filters.")
+    st.stop()
 
+summary_df = build_category_summary(df)
+top_videos_df = build_top_videos(df)
+diagnostic_df = build_diagnostic_table(df)
+forecast_df = build_forecast(df)
+recommendations_df = build_recommendations(df)
 
-    st.subheader("📊 Views per Category")
+latest_records = df.sort_values("fetched_at").drop_duplicates(subset=["video_id"], keep="last")
 
-    # Convert all categories to string and map codes to names for all graphs
-    categories = list(df["category"])
-    views = list(df["views"])
-    likes = list(df["likes"])
-    comments = list(df["comments"])
-    engagements = list(df["engagement"])
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Unique Videos", f"{latest_records['video_id'].nunique():,}")
+k2.metric("Total Views", f"{int(latest_records['views'].sum()):,}")
+k3.metric("Avg Engagement Rate", f"{latest_records['engagement_rate'].mean() * 100:.2f}%")
+k4.metric("Tracked Categories", f"{latest_records['category'].nunique():,}")
 
-    # Views per Category
-    cleaned = []
-    for cat, v in zip(categories, views):
-        cat_str = str(cat).strip()
-        cat_str = category_map.get(cat_str, cat_str)
-        if cat_str.lower() not in ["nan", "none", ""]:
-            cleaned.append((cat_str, v))
-    from collections import defaultdict
-    agg = defaultdict(int)
-    for cat, v in cleaned:
-        try:
-            v_int = int(v)
-        except:
-            v_int = 0
-        agg[cat] += v_int
-    sorted_items = sorted(agg.items(), key=lambda x: x[1], reverse=True)
-    import pandas as pd
-    chart_df = pd.DataFrame(sorted_items, columns=["category", "views"])
-    chart_df.set_index("category", inplace=True)
-    st.bar_chart(chart_df)
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Descriptive", "Diagnostic", "Predictive", "Prescriptive"]
+)
 
-    # Likes per Category
-    cleaned_likes = []
-    for cat, l in zip(categories, likes):
-        cat_str = str(cat).strip()
-        cat_str = category_map.get(cat_str, cat_str)
-        if cat_str.lower() not in ["nan", "none", ""]:
-            cleaned_likes.append((cat_str, l))
-    agg_likes = defaultdict(int)
-    for cat, l in cleaned_likes:
-        try:
-            l_int = int(l)
-        except:
-            l_int = 0
-        agg_likes[cat] += l_int
-    sorted_likes = sorted(agg_likes.items(), key=lambda x: x[1], reverse=True)
-    likes_df = pd.DataFrame(sorted_likes, columns=["category", "likes"])
-    likes_df.set_index("category", inplace=True)
-    # Example: st.bar_chart(likes_df)  # Uncomment to show likes per category
+with tab1:
+    st.subheader("1. What is happening?")
+    st.markdown("Analytical question: Which categories and videos are driving the most business value?")
 
-    # Comments per Category
-    cleaned_comments = []
-    for cat, c in zip(categories, comments):
-        cat_str = str(cat).strip()
-        cat_str = category_map.get(cat_str, cat_str)
-        if cat_str.lower() not in ["nan", "none", ""]:
-            cleaned_comments.append((cat_str, c))
-    agg_comments = defaultdict(int)
-    for cat, c in cleaned_comments:
-        try:
-            c_int = int(c)
-        except:
-            c_int = 0
-        agg_comments[cat] += c_int
-    sorted_comments = sorted(agg_comments.items(), key=lambda x: x[1], reverse=True)
-    comments_df = pd.DataFrame(sorted_comments, columns=["category", "comments"])
-    comments_df.set_index("category", inplace=True)
-    # Example: st.bar_chart(comments_df)  # Uncomment to show comments per category
+    category_chart = (
+        alt.Chart(summary_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("total_views:Q", title="Total Views"),
+            y=alt.Y("category:N", sort="-x", title="Category"),
+            tooltip=["category", "videos", "total_views", "total_likes", "total_comments", alt.Tooltip("avg_engagement_rate:Q", format=".2%")],
+            color=alt.Color("avg_engagement_rate:Q", title="Avg Engagement Rate"),
+        )
+        .properties(height=350)
+    )
+    st.altair_chart(category_chart, use_container_width=True)
 
+    st.subheader("Top Videos")
+    st.dataframe(top_videos_df, use_container_width=True)
 
-    st.subheader("❤️ Likes vs Views (Sampled)")
-    # Map category for sampled data as well
-    sample_df = df.sample(min(200, len(df))).copy()
-    sample_df["category"] = sample_df["category"].apply(lambda x: category_map.get(str(x).strip(), str(x).strip()))
-    st.scatter_chart(sample_df[["views", "likes"]])
+with tab2:
+    st.subheader("2. Why is it happening?")
+    st.markdown("Analytical question: Which categories are efficient, and which videos are underperforming versus their category baseline?")
 
+    scatter = (
+        alt.Chart(summary_df)
+        .mark_circle(size=180)
+        .encode(
+            x=alt.X("total_views:Q", title="Total Views"),
+            y=alt.Y("avg_engagement_rate:Q", title="Average Engagement Rate"),
+            tooltip=["category", "videos", "total_views", alt.Tooltip("avg_engagement_rate:Q", format=".2%")],
+            color=alt.Color("category:N", legend=None),
+        )
+        .properties(height=350)
+    )
+    st.altair_chart(scatter, use_container_width=True)
 
-    st.subheader("💬 Comments Spike Detection")
-    # Map category for spike detection if needed (not used in chart, but for consistency)
-    df["category"] = df["category"].apply(lambda x: category_map.get(str(x).strip(), str(x).strip()))
-    df["comment_change"] = df["comments"].diff().fillna(0)
-    df["spike"] = df["comment_change"].apply(lambda x: x if x > 1000 else 0)
-    st.bar_chart(df["spike"].tail(200))
+    st.subheader("Underperforming Videos")
+    st.dataframe(diagnostic_df, use_container_width=True)
 
+with tab3:
+    st.subheader("3. What will happen?")
+    st.markdown("Analytical question: Based on recent snapshots, which categories are likely to keep growing?")
 
+    if forecast_df.empty:
+        st.info("Forecast needs at least 2 time snapshots per category. It becomes useful after rerunning the enriched producer.")
+    else:
+        forecast_chart = (
+            alt.Chart(forecast_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("time_bucket:T", title="Time") if pd.api.types.is_datetime64_any_dtype(forecast_df["time_bucket"]) else alt.X("time_bucket:N", title="Step"),
+                y=alt.Y("total_views:Q", title="Views"),
+                color="category:N",
+                strokeDash="series:N",
+                tooltip=["category", "series", "time_bucket", "total_views"],
+            )
+            .properties(height=380)
+        )
+        st.altair_chart(forecast_chart, use_container_width=True)
 
-    st.subheader("🔥 Engagement by Category")
-    # Aggregate engagement by mapped category name (pure Python)
-    cleaned_eng = []
-    for cat, eng in zip(categories, engagements):
-        cat_str = str(cat).strip()
-        cat_str = category_map.get(cat_str, cat_str)
-        if cat_str.lower() not in ["nan", "none", ""]:
-            try:
-                eng_val = float(eng)
-            except:
-                eng_val = 0.0
-            cleaned_eng.append((cat_str, eng_val))
-    eng_sum = defaultdict(float)
-    eng_count = defaultdict(int)
-    for cat, eng in cleaned_eng:
-        eng_sum[cat] += eng
-        eng_count[cat] += 1
-    eng_avg = {cat: (eng_sum[cat] / eng_count[cat]) if eng_count[cat] > 0 else 0.0 for cat in eng_sum}
-    sorted_eng = sorted(eng_avg.items(), key=lambda x: x[1], reverse=True)
-    eng_df = pd.DataFrame(sorted_eng, columns=["category", "engagement"])
-    eng_df.set_index("category", inplace=True)
-    st.bar_chart(eng_df)
+with tab4:
+    st.subheader("4. What should be done?")
+    st.markdown("Analytical question: Which actions should a content or marketing team take next?")
 
-    # -------------------------------
-    # Raw Data
-    # -------------------------------
-    st.subheader("📄 Raw Data")
-    st.dataframe(df)
+    st.dataframe(recommendations_df, use_container_width=True)
 
-# -------------------------------
-# Auto Refresh
-# -------------------------------
-time.sleep(10)
-st.rerun()
+    st.subheader("Business Summary")
+    st.write(
+        f"- Best-performing category by views: **{summary_df.iloc[0]['category']}**"
+    )
+    st.write(
+        f"- Strongest average engagement: **{summary_df.sort_values('avg_engagement_rate', ascending=False).iloc[0]['category']}**"
+    )
+    st.write(
+        "- Use this section in your presentation as the prescriptive analytics part."
+    )
+
+with st.expander("Raw Data"):
+    st.dataframe(df, use_container_width=True)
