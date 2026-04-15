@@ -26,7 +26,9 @@ from analytics.business_analysis import (
     build_bubble_dataset,
     build_outlier_videos,
     build_category_growth,
+    build_comments_vs_views,
 )
+
 
 DELTA_PATH = "storage/delta_tables/youtube"
 
@@ -112,8 +114,10 @@ channel_board_df = build_channel_leaderboard(df)
 bubble_df = build_bubble_dataset(df)
 outlier_df = build_outlier_videos(df)
 growth_df = build_category_growth(df)
+comments_vs_views_df = build_comments_vs_views(df)
 
-latest_records = df.sort_values("fetched_at").drop_duplicates(subset=["video_id"], keep="last")
+
+latest_records = df.sort_values("timestamp").drop_duplicates(subset=["video_id"], keep="last")
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Unique Videos", f"{latest_records['video_id'].nunique():,}")
@@ -332,6 +336,36 @@ with tab2:
             .properties(height=400)
         )
         st.altair_chart(bubble_chart, width="stretch")
+
+    st.subheader("Comments vs Views")
+    st.markdown("Analytical question: Which videos generate unusually high discussion relative to reach?")
+
+    if comments_vs_views_df.empty:
+        st.info("Not enough data for comments vs views analysis yet.")
+    else:
+        comments_views_chart = (
+            alt.Chart(comments_vs_views_df)
+            .mark_circle(opacity=0.7)
+            .encode(
+                x=alt.X("views:Q", title="Views"),
+                y=alt.Y("comments:Q", title="Comments"),
+                color=alt.Color("category:N", title="Category"),
+                size=alt.Size("likes:Q", title="Likes"),
+                tooltip=[
+                    alt.Tooltip("title:N", title="Title"),
+                    alt.Tooltip("channel_title:N", title="Channel"),
+                    alt.Tooltip("region:N", title="Region"),
+                    alt.Tooltip("category:N", title="Category"),
+                    alt.Tooltip("rank:Q", title="Rank"),
+                    alt.Tooltip("views:Q", title="Views", format=","),
+                    alt.Tooltip("comments:Q", title="Comments", format=","),
+                    alt.Tooltip("likes:Q", title="Likes", format=","),
+                ],
+            )
+            .properties(height=400)
+        )
+        st.altair_chart(comments_views_chart, width="stretch")
+
 
     st.subheader("Underperforming Videos")
     st.dataframe(diagnostic_df, width="stretch")

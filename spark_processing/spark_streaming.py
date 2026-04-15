@@ -8,6 +8,7 @@ from pyspark.sql.types import (
     DoubleType,
 )
 
+
 KAFKA_BROKER = "localhost:9092"
 TOPIC = "youtube-data"
 DELTA_PATH = "storage/delta_tables/youtube"
@@ -33,21 +34,22 @@ spark = (
 spark.sparkContext.setLogLevel("WARN")
 
 schema = StructType([
-    StructField("video_id", StringType(), True),
-    StructField("title", StringType(), True),
-    StructField("channel_title", StringType(), True),
-    StructField("published_at", StringType(), True),
-    StructField("fetched_at", StringType(), True),
+    StructField("timestamp", StringType(), True),
+    StructField("surface", StringType(), True),
+    StructField("page_number", IntegerType(), True),
+    StructField("rank", IntegerType(), True),
     StructField("region", StringType(), True),
-    StructField("category_id", StringType(), True),
     StructField("category", StringType(), True),
-    StructField("duration", StringType(), True),
+    StructField("category_id", StringType(), True),
+    StructField("video_id", StringType(), True),
+    StructField("channel_id", StringType(), True),
+    StructField("channel_title", StringType(), True),
+    StructField("title", StringType(), True),
     StructField("views", IntegerType(), True),
     StructField("likes", IntegerType(), True),
     StructField("comments", IntegerType(), True),
+    StructField("publish_time", StringType(), True),
     StructField("engagements", IntegerType(), True),
-    StructField("like_rate", DoubleType(), True),
-    StructField("comment_rate", DoubleType(), True),
     StructField("engagement_rate", DoubleType(), True),
 ])
 

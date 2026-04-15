@@ -9,49 +9,66 @@ def prepare_dashboard_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     defaults = {
-        "video_id": None,
-        "channel_title": "Unknown",
-        "published_at": None,
-        "fetched_at": None,
+        "timestamp": None,
+        "surface": "mostPopular",
+        "page_number": 1,
+        "rank": None,
         "region": "IN",
         "category": "Other",
+        "category_id": None,
+        "video_id": None,
+        "channel_id": None,
+        "channel_title": "Unknown",
+        "title": "",
         "views": 0,
         "likes": 0,
         "comments": 0,
+        "publish_time": None,
         "engagements": 0,
+        "engagement_rate": 0.0,
         "like_rate": 0.0,
         "comment_rate": 0.0,
-        "engagement_rate": 0.0,
     }
 
     for col, value in defaults.items():
         if col not in df.columns:
             df[col] = value
 
-    for col in ["views", "likes", "comments", "engagements"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    numeric_cols = [
+        "views",
+        "likes",
+        "comments",
+        "engagements",
+        "engagement_rate",
+        "like_rate",
+        "comment_rate",
+        "page_number",
+        "rank",
+    ]
 
-    if "engagements" not in df.columns or (df["engagements"] == 0).all():
-        df["engagements"] = df["likes"] + df["comments"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["views"] = pd.to_numeric(df["views"], errors="coerce").fillna(0)
-    df["likes"] = pd.to_numeric(df["likes"], errors="coerce").fillna(0)
-    df["comments"] = pd.to_numeric(df["comments"], errors="coerce").fillna(0)
-    df["engagements"] = pd.to_numeric(df["engagements"], errors="coerce").fillna(0)
+    df["views"] = df["views"].fillna(0)
+    df["likes"] = df["likes"].fillna(0)
+    df["comments"] = df["comments"].fillna(0)
+    df["engagements"] = df["engagements"].fillna(df["likes"] + df["comments"])
 
     safe_views = df["views"].replace(0, pd.NA)
 
-    df["engagement_rate"] = (df["engagements"] / safe_views).fillna(0)
     df["like_rate"] = (df["likes"] / safe_views).fillna(0)
     df["comment_rate"] = (df["comments"] / safe_views).fillna(0)
+    df["engagement_rate"] = (df["engagements"] / safe_views).fillna(0)
 
-    df["engagement_rate"] = df["engagement_rate"].replace([float("inf"), -float("inf")], 0)
     df["like_rate"] = df["like_rate"].replace([float("inf"), -float("inf")], 0)
     df["comment_rate"] = df["comment_rate"].replace([float("inf"), -float("inf")], 0)
+    df["engagement_rate"] = df["engagement_rate"].replace([float("inf"), -float("inf")], 0)
 
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df["publish_time"] = pd.to_datetime(df["publish_time"], errors="coerce", utc=True)
 
-    df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce", utc=True)
-    df["fetched_at"] = pd.to_datetime(df["fetched_at"], errors="coerce", utc=True)
+    df["category"] = df["category"].fillna("Other").astype(str).str.strip()
+    df["surface"] = df["surface"].fillna("mostPopular").astype(str)
 
     if df["video_id"].isna().all():
         df["video_id"] = (
@@ -66,7 +83,7 @@ def prepare_dashboard_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_category_summary(df: pd.DataFrame) -> pd.DataFrame:
-    work = df.copy()
+    work = build_latest_snapshot_df(df)
     work["category"] = work["category"].fillna("Other").astype(str).str.strip()
 
     summary = (
@@ -80,10 +97,8 @@ def build_category_summary(df: pd.DataFrame) -> pd.DataFrame:
             avg_like_rate=("like_rate", "mean"),
         )
         .reset_index()
+        .sort_values(["total_views", "avg_engagement_rate"], ascending=[False, False])
     )
-
-    summary = summary[summary["videos"] > 0]
-    summary = summary.sort_values(["total_views", "avg_engagement_rate"], ascending=[False, False])
 
     return summary
 
@@ -91,9 +106,10 @@ def build_category_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_top_videos(df: pd.DataFrame, top_n: int = 15) -> pd.DataFrame:
     top = (
-        df.sort_values(["views", "engagement_rate"], ascending=[False, False])
-        .drop_duplicates(subset=["video_id"])
-        .loc[:, ["title", "channel_title", "category", "region", "views", "likes", "comments", "engagement_rate"]]
+        df.sort_values(["timestamp", "views", "engagement_rate"], ascending=[True, False, False])
+        .drop_duplicates(subset=["video_id", "region"], keep="last")
+        .sort_values(["views", "engagement_rate"], ascending=[False, False])
+        .loc[:, ["title", "channel_title", "category", "region", "views", "likes", "comments", "engagement_rate", "rank"]]
         .head(top_n)
     )
     return top
@@ -110,8 +126,8 @@ def build_diagnostic_table(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     latest = (
-        df.sort_values("fetched_at")
-        .drop_duplicates(subset=["video_id"], keep="last")
+        df.sort_values("timestamp")
+        .drop_duplicates(subset=["video_id", "region"], keep="last")
         .merge(category_baseline, on="category", how="left")
     )
 
@@ -130,6 +146,7 @@ def build_diagnostic_table(df: pd.DataFrame) -> pd.DataFrame:
             "category_avg_engagement_rate",
             "engagement_gap",
             "view_gap",
+            "rank",
         ],
     ].sort_values(["engagement_gap", "view_gap"], ascending=[True, True])
 
@@ -142,8 +159,8 @@ def build_forecast(df: pd.DataFrame, top_n_categories: int = 5, horizon: int = 3
 
     work = df.copy()
 
-    if work["fetched_at"].notna().any():
-        work["time_bucket"] = work["fetched_at"].dt.floor("1min")
+    if work["timestamp"].notna().any():
+        work["time_bucket"] = work["timestamp"].dt.floor("5min")
     else:
         work = work.reset_index(drop=True)
         work["time_bucket"] = work.index.astype(str)
@@ -196,7 +213,7 @@ def build_forecast(df: pd.DataFrame, top_n_categories: int = 5, horizon: int = 3
             pred = max(0, float(model.predict(future_step)[0]))
 
             if isinstance(last_time, pd.Timestamp):
-                future_bucket = last_time + pd.Timedelta(hours=i)
+                future_bucket = last_time + pd.Timedelta(minutes=5 * i)
             else:
                 future_bucket = f"Forecast {i}"
 
@@ -265,13 +282,13 @@ def build_recommendations(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_views_timeseries(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "fetched_at" not in df.columns:
+    if df.empty or "timestamp" not in df.columns:
         return pd.DataFrame()
 
     work = df.copy()
-    work["fetched_at"] = pd.to_datetime(work["fetched_at"], errors="coerce", utc=True)
-    work = work.dropna(subset=["fetched_at"])
-    work["time_bucket"] = work["fetched_at"].dt.floor("1min")
+    work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce", utc=True)
+    work = work.dropna(subset=["timestamp"])
+    work["time_bucket"] = work["timestamp"].dt.floor("5min")
 
     ts = (
         work.groupby(["category", "time_bucket"], as_index=False)
@@ -285,13 +302,13 @@ def build_views_timeseries(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_region_timeseries(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "fetched_at" not in df.columns or "region" not in df.columns:
+    if df.empty or "timestamp" not in df.columns or "region" not in df.columns:
         return pd.DataFrame()
 
     work = df.copy()
-    work["fetched_at"] = pd.to_datetime(work["fetched_at"], errors="coerce", utc=True)
-    work = work.dropna(subset=["fetched_at"])
-    work["time_bucket"] = work["fetched_at"].dt.floor("1min")
+    work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce", utc=True)
+    work = work.dropna(subset=["timestamp"])
+    work["time_bucket"] = work["timestamp"].dt.floor("5min")
 
     ts = (
         work.groupby(["region", "time_bucket"], as_index=False)
@@ -305,15 +322,15 @@ def build_region_timeseries(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_publish_hour_heatmap(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "published_at" not in df.columns:
+    if df.empty or "publish_time" not in df.columns:
         return pd.DataFrame()
 
     work = df.copy()
-    work["published_at"] = pd.to_datetime(work["published_at"], errors="coerce", utc=True)
-    work = work.dropna(subset=["published_at"])
+    work["publish_time"] = pd.to_datetime(work["publish_time"], errors="coerce", utc=True)
+    work = work.dropna(subset=["publish_time"])
 
-    work["publish_day"] = work["published_at"].dt.day_name()
-    work["publish_hour"] = work["published_at"].dt.hour
+    work["publish_day"] = work["publish_time"].dt.day_name()
+    work["publish_hour"] = work["publish_time"].dt.hour
 
     day_order = [
         "Monday", "Tuesday", "Wednesday",
@@ -333,13 +350,13 @@ def build_publish_hour_heatmap(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_category_share_over_time(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "fetched_at" not in df.columns:
+    if df.empty or "timestamp" not in df.columns:
         return pd.DataFrame()
 
     work = df.copy()
-    work["fetched_at"] = pd.to_datetime(work["fetched_at"], errors="coerce", utc=True)
-    work = work.dropna(subset=["fetched_at"])
-    work["time_bucket"] = work["fetched_at"].dt.floor("1min")
+    work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce", utc=True)
+    work = work.dropna(subset=["timestamp"])
+    work["time_bucket"] = work["timestamp"].dt.floor("5min")
 
     grouped = (
         work.groupby(["category", "time_bucket"], as_index=False)
@@ -379,8 +396,8 @@ def build_bubble_dataset(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     latest = (
-        df.sort_values("fetched_at")
-        .drop_duplicates(subset=["video_id"], keep="last")
+        df.sort_values("timestamp")
+        .drop_duplicates(subset=["video_id", "region"], keep="last")
         .copy()
     )
 
@@ -404,8 +421,8 @@ def build_outlier_videos(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
         return pd.DataFrame()
 
     latest = (
-        df.sort_values("fetched_at")
-        .drop_duplicates(subset=["video_id"], keep="last")
+        df.sort_values("timestamp")
+        .drop_duplicates(subset=["video_id", "region"], keep="last")
         .copy()
     )
 
@@ -455,15 +472,14 @@ def build_outlier_videos(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
     ]
 
 
-
 def build_category_growth(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "fetched_at" not in df.columns:
+    if df.empty or "timestamp" not in df.columns:
         return pd.DataFrame()
 
     work = df.copy()
-    work["fetched_at"] = pd.to_datetime(work["fetched_at"], errors="coerce", utc=True)
-    work = work.dropna(subset=["fetched_at"])
-    work["time_bucket"] = work["fetched_at"].dt.floor("1min")
+    work["timestamp"] = pd.to_datetime(work["timestamp"], errors="coerce", utc=True)
+    work = work.dropna(subset=["timestamp"])
+    work["time_bucket"] = work["timestamp"].dt.floor("5min")
 
     ts = (
         work.groupby(["category", "time_bucket"], as_index=False)
@@ -478,4 +494,40 @@ def build_category_growth(df: pd.DataFrame) -> pd.DataFrame:
 
     return ts.dropna(subset=["growth_rate"])
 
+
+def build_comments_vs_views(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    latest = (
+        df.sort_values("timestamp")
+        .drop_duplicates(subset=["video_id", "region"], keep="last")
+        .copy()
+    )
+
+    latest = latest[
+        [
+            "title",
+            "category",
+            "region",
+            "channel_title",
+            "views",
+            "comments",
+            "likes",
+            "rank",
+        ]
+    ].dropna(subset=["views", "comments"])
+
+    return latest
+
+def build_latest_snapshot_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    latest = (
+        df.sort_values("timestamp")
+        .drop_duplicates(subset=["video_id", "region"], keep="last")
+        .copy()
+    )
+    return latest
 
