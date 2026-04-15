@@ -1,23 +1,23 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
-from pyspark.sql.types import *
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    IntegerType,
+    DoubleType,
+)
 
-# -------------------------------
-# Spark Session (FIXED)
-# -------------------------------
-spark = SparkSession.builder \
-    .appName("YouTubeAnalytics") \
-    .master("local[*]") \
-    .config("spark.driver.host", "127.0.0.1") \
-    .config("spark.driver.bindAddress", "127.0.0.1") \
-    .config("spark.jars", "jars/delta-core_2.12-2.4.0.jar,jars/spark-sql-kafka-0-10_2.12-3.4.1.jar") \
-    .config("spark.jars", "jars/delta-core_2.12-2.4.0.jar,jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,jars/kafka-clients-3.4.1.jar")\
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-    .config("spark.hadoop.security.authentication", "simple") \
-    .config("spark.hadoop.security.authorization", "false") \
-    .config("spark.driver.extraJavaOptions", "--add-opens java.base/javax.security.auth=ALL-UNNAMED") \
-    .config("spark.executor.extraJavaOptions", "--add-opens java.base/javax.security.auth=ALL-UNNAMED") \
+KAFKA_BROKER = "localhost:9092"
+TOPIC = "youtube-data"
+DELTA_PATH = "storage/delta_tables/youtube"
+CHECKPOINT_PATH = "storage/checkpoints"
+
+spark = (
+    SparkSession.builder.appName("YouTubeSparkStreaming")
+    .master("local[*]")
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
     .config(
         "spark.jars",
         "jars/delta-core_2.12-2.4.0.jar,"
@@ -25,50 +25,52 @@ spark = SparkSession.builder \
         "jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,"
         "jars/spark-token-provider-kafka-0-10_2.12-3.4.1.jar,"
         "jars/kafka-clients-3.4.1.jar,"
-        "jars/commons-pool2-2.11.1.jar"
-    )\
+        "jars/commons-pool2-2.11.1.jar",
+    )
     .getOrCreate()
- 
-# -------------------------------
-# Schema
-# -------------------------------
+)
+
+spark.sparkContext.setLogLevel("WARN")
+
 schema = StructType([
-    StructField("title", StringType()),
-    StructField("category", StringType()),
-    StructField("views", StringType()),
-    StructField("likes", StringType()),
-    StructField("comments", StringType())
+    StructField("video_id", StringType(), True),
+    StructField("title", StringType(), True),
+    StructField("channel_title", StringType(), True),
+    StructField("published_at", StringType(), True),
+    StructField("fetched_at", StringType(), True),
+    StructField("region", StringType(), True),
+    StructField("category_id", StringType(), True),
+    StructField("category", StringType(), True),
+    StructField("duration", StringType(), True),
+    StructField("views", IntegerType(), True),
+    StructField("likes", IntegerType(), True),
+    StructField("comments", IntegerType(), True),
+    StructField("engagements", IntegerType(), True),
+    StructField("like_rate", DoubleType(), True),
+    StructField("comment_rate", DoubleType(), True),
+    StructField("engagement_rate", DoubleType(), True),
 ])
 
-# -------------------------------
-# Read Kafka Stream
-# -------------------------------
-raw_df = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "youtube-data") \
+kafka_df = (
+    spark.readStream.format("kafka")
+    .option("kafka.bootstrap.servers", KAFKA_BROKER)
+    .option("subscribe", TOPIC)
+    .option("startingOffsets", "latest")
     .load()
+)
 
-parsed_df = raw_df.selectExpr("CAST(value AS STRING)") \
-    .select(from_json(col("value"), schema).alias("data")) \
+parsed_df = (
+    kafka_df.selectExpr("CAST(value AS STRING) as json_value")
+    .select(from_json(col("json_value"), schema).alias("data"))
     .select("data.*")
+)
 
-# -------------------------------
-# Clean Data
-# -------------------------------
-clean_df = parsed_df \
-    .withColumn("views", col("views").cast("int")) \
-    .withColumn("likes", col("likes").cast("int")) \
-    .withColumn("comments", col("comments").cast("int"))
+query = (
+    parsed_df.writeStream.format("delta")
+    .outputMode("append")
+    .option("checkpointLocation", CHECKPOINT_PATH)
+    .start(DELTA_PATH)
+)
 
-# -------------------------------
-# Write to Delta Lake
-# -------------------------------
-query = clean_df.writeStream \
-    .format("delta") \
-    .option("path", "storage/delta_tables/youtube") \
-    .option("checkpointLocation", "storage/checkpoints") \
-    .outputMode("append") \
-    .start()
-
+print("Spark streaming started. Writing enriched YouTube data to Delta Lake...")
 query.awaitTermination()
