@@ -5,14 +5,13 @@ from pyspark.sql.types import (
     StructField,
     StringType,
     IntegerType,
-    DoubleType,
+    BooleanType,
 )
-
 
 KAFKA_BROKER = "localhost:9092"
 TOPIC = "youtube-data"
-DELTA_PATH = "storage/delta_tables/youtube"
-CHECKPOINT_PATH = "storage/checkpoints"
+DELTA_PATH = "storage/delta_tables/youtube_enriched"
+CHECKPOINT_PATH = "storage/checkpoints_enriched"
 
 spark = (
     SparkSession.builder.appName("YouTubeSparkStreaming")
@@ -34,23 +33,42 @@ spark = (
 spark.sparkContext.setLogLevel("WARN")
 
 schema = StructType([
-    StructField("timestamp", StringType(), True),
+    StructField("collection_batch_id", StringType(), True),
+    StructField("collected_at", StringType(), True),
     StructField("surface", StringType(), True),
-    StructField("page_number", IntegerType(), True),
-    StructField("rank", IntegerType(), True),
-    StructField("region", StringType(), True),
-    StructField("category", StringType(), True),
-    StructField("category_id", StringType(), True),
+    StructField("trending_region", StringType(), True),
+    StructField("trending_category_id", StringType(), True),
+    StructField("trending_page", IntegerType(), True),
+    StructField("trending_rank", IntegerType(), True),
+
     StructField("video_id", StringType(), True),
+    StructField("title", StringType(), True),
+    StructField("description", StringType(), True),
+    StructField("published_at", StringType(), True),
+    StructField("category_id", StringType(), True),
+    StructField("category_name", StringType(), True),
+    StructField("tags", StringType(), True),
+    StructField("default_language", StringType(), True),
+    StructField("thumbnail_url", StringType(), True),
+
+    StructField("view_count", IntegerType(), True),
+    StructField("like_count", IntegerType(), True),
+    StructField("comment_count", IntegerType(), True),
+    StructField("favorite_count", IntegerType(), True),
+
+    StructField("duration_iso", StringType(), True),
+    StructField("definition", StringType(), True),
+    StructField("caption", BooleanType(), True),
+    StructField("licensed_content", BooleanType(), True),
+    StructField("content_rating", StringType(), True),
+    StructField("projection", StringType(), True),
+
     StructField("channel_id", StringType(), True),
     StructField("channel_title", StringType(), True),
-    StructField("title", StringType(), True),
-    StructField("views", IntegerType(), True),
-    StructField("likes", IntegerType(), True),
-    StructField("comments", IntegerType(), True),
-    StructField("publish_time", StringType(), True),
-    StructField("engagements", IntegerType(), True),
-    StructField("engagement_rate", DoubleType(), True),
+    StructField("channel_subscriber_count", IntegerType(), True),
+    StructField("channel_view_count", IntegerType(), True),
+    StructField("channel_video_count", IntegerType(), True),
+    StructField("channel_country", StringType(), True),
 ])
 
 kafka_df = (

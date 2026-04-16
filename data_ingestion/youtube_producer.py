@@ -1,5 +1,6 @@
 import json
 import time
+import uuid
 from datetime import datetime, timezone
 
 import requests
@@ -15,6 +16,8 @@ from config import (
     PAGES_PER_CATEGORY,
     POLL_SECONDS,
     REQUEST_TIMEOUT,
+    CHANNEL_BATCH_SIZE,
+    DESCRIPTION_LIMIT,
 )
 
 BASE_URL = "https://www.googleapis.com/youtube/v3"
@@ -75,15 +78,16 @@ def fetch_category_map(region):
             "key": API_KEY,
         },
     )
-    return {
+    category_map = {
         item["id"]: item["snippet"]["title"]
         for item in payload.get("items", [])
     }
+    return {**FALLBACK_CATEGORY_MAP, **category_map}
 
 
 def fetch_popular_videos(region, category_id=None, page_token=None):
     params = {
-        "part": "snippet,statistics",
+        "part": "snippet,statistics,contentDetails",
         "chart": "mostPopular",
         "regionCode": region,
         "maxResults": MAX_RESULTS,
@@ -99,44 +103,148 @@ def fetch_popular_videos(region, category_id=None, page_token=None):
     return fetch_json("videos", params)
 
 
-def build_record(item, region, category_map, fetched_at, page_number, rank):
+def chunked(values, size):
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
+def fetch_channel_details(channel_ids):
+    details = {}
+    if not channel_ids:
+        return details
+
+    for chunk in chunked(sorted(set(channel_ids)), CHANNEL_BATCH_SIZE):
+        attempts = 0
+        max_attempts = 3
+
+        while attempts < max_attempts:
+            try:
+                payload = fetch_json(
+                    "channels",
+                    {
+                        "part": "snippet,statistics",
+                        "id": ",".join(chunk),
+                        "key": API_KEY,
+                    },
+                )
+
+                for item in payload.get("items", []):
+                    snippet = item.get("snippet", {})
+                    stats = item.get("statistics", {})
+
+                    details[item.get("id")] = {
+                        "channel_id": item.get("id"),
+                        "channel_title": snippet.get("title", "Unknown"),
+                        "channel_subscriber_count": safe_int(stats.get("subscriberCount")),
+                        "channel_view_count": safe_int(stats.get("viewCount")),
+                        "channel_video_count": safe_int(stats.get("videoCount")),
+                        "channel_country": snippet.get("country"),
+                    }
+
+                break
+
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                attempts += 1
+
+                if status_code == 503 and attempts < max_attempts:
+                    print(
+                        f"[WARN] channels.list temporary 503, retrying "
+                        f"({attempts}/{max_attempts})..."
+                    )
+                    time.sleep(2 * attempts)
+                    continue
+
+                print(f"[WARN] Failed to fetch channel details: {exc}")
+                break
+
+            except Exception as exc:
+                attempts += 1
+                if attempts < max_attempts:
+                    print(
+                        f"[WARN] Channel details fetch failed, retrying "
+                        f"({attempts}/{max_attempts}): {exc}"
+                    )
+                    time.sleep(2 * attempts)
+                    continue
+
+                print(f"[WARN] Failed to fetch channel details: {exc}")
+                break
+
+    return details
+
+
+def build_record(item, region, category_map, channel_map, collected_at, page_number, rank, batch_id):
     snippet = item.get("snippet", {})
     stats = item.get("statistics", {})
+    content = item.get("contentDetails", {})
 
     category_id = snippet.get("categoryId", "")
-    category_name = (
-        category_map.get(category_id)
-        or FALLBACK_CATEGORY_MAP.get(category_id)
-        or "Other"
-    )
+    category_name = category_map.get(category_id) or FALLBACK_CATEGORY_MAP.get(category_id) or "Other"
+    channel_id = snippet.get("channelId")
+
+    channel_info = channel_map.get(channel_id, {})
 
     views = safe_int(stats.get("viewCount"))
     likes = safe_int(stats.get("likeCount"))
     comments = safe_int(stats.get("commentCount"))
+    favorites = safe_int(stats.get("favoriteCount"))
+
+    thumbnails = snippet.get("thumbnails", {})
+    thumb = (
+        thumbnails.get("high", {})
+        or thumbnails.get("medium", {})
+        or thumbnails.get("default", {})
+    )
 
     return {
-        "timestamp": fetched_at,
+        # Trending context
+        "collection_batch_id": batch_id,
+        "collected_at": collected_at,
         "surface": "mostPopular",
-        "page_number": page_number,
-        "rank": rank,
-        "region": region,
-        "category": category_name,
-        "category_id": category_id,
+        "trending_region": region,
+        "trending_category_id": category_id,
+        "trending_page": page_number,
+        "trending_rank": rank,
+
+        # Video identity
         "video_id": item.get("id"),
-        "channel_id": snippet.get("channelId"),
-        "channel_title": snippet.get("channelTitle", "Unknown"),
         "title": snippet.get("title", ""),
-        "views": views,
-        "likes": likes,
-        "comments": comments,
-        "publish_time": snippet.get("publishedAt"),
-        "engagements": likes + comments,
-        "engagement_rate": round((likes + comments) / views, 6) if views else 0.0,
+        "description": (snippet.get("description") or "")[:DESCRIPTION_LIMIT],
+        "published_at": snippet.get("publishedAt"),
+        "category_id": category_id,
+        "category_name": category_name,
+        "tags": json.dumps(snippet.get("tags", [])),
+        "default_language": snippet.get("defaultLanguage"),
+        "thumbnail_url": thumb.get("url"),
+
+        # Engagement metrics
+        "view_count": views,
+        "like_count": likes,
+        "comment_count": comments,
+        "favorite_count": favorites,
+
+        # Content details
+        "duration_iso": content.get("duration"),
+        "definition": content.get("definition"),
+        "caption": str(content.get("caption", "")).lower() == "true",
+        "licensed_content": bool(content.get("licensedContent", False)),
+        "content_rating": json.dumps(content.get("contentRating", {})),
+        "projection": content.get("projection"),
+
+        # Channel info
+        "channel_id": channel_id,
+        "channel_title": channel_info.get("channel_title", snippet.get("channelTitle", "Unknown")),
+        "channel_subscriber_count": channel_info.get("channel_subscriber_count", 0),
+        "channel_view_count": channel_info.get("channel_view_count", 0),
+        "channel_video_count": channel_info.get("channel_video_count", 0),
+        "channel_country": channel_info.get("channel_country"),
     }
 
 
 def fetch_youtube_data():
-    fetched_at = datetime.now(timezone.utc).isoformat()
+    collected_at = datetime.now(timezone.utc).isoformat()
+    batch_id = str(uuid.uuid4())
     records = []
     seen = set()
 
@@ -162,20 +270,33 @@ def fetch_youtube_data():
                     )
 
                     items = payload.get("items", [])
+                    if not items:
+                        break
+
+                    channel_ids = [
+                        item.get("snippet", {}).get("channelId")
+                        for item in items
+                        if item.get("snippet", {}).get("channelId")
+                    ]
+                    channel_map = fetch_channel_details(channel_ids)
+
                     for item_index, item in enumerate(items, start=1):
                         rank = page_index * MAX_RESULTS + item_index
+
                         record = build_record(
                             item=item,
                             region=region,
                             category_map=category_map,
-                            fetched_at=fetched_at,
+                            channel_map=channel_map,
+                            collected_at=collected_at,
                             page_number=page_index + 1,
                             rank=rank,
+                            batch_id=batch_id,
                         )
 
                         dedupe_key = (
-                            record["timestamp"],
-                            record["region"],
+                            record["collection_batch_id"],
+                            record["trending_region"],
                             record["video_id"],
                         )
                         if dedupe_key not in seen:
@@ -188,9 +309,9 @@ def fetch_youtube_data():
 
                 except requests.HTTPError as exc:
                     status_code = exc.response.status_code if exc.response is not None else None
-                    if status_code == 404:
+                    if status_code in (403, 404):
                         unsupported_pairs.add((region, category_id))
-                        print(f"[INFO] Skipping unsupported category {category_id} for region {region}")
+                        print(f"[INFO] Skipping unsupported/forbidden category {category_id} for region {region}")
                     else:
                         print(f"[WARN] Failed for region={region}, category={category_id}: {exc}")
                     break
