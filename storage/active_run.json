@@ -1,0 +1,14 @@
+{
+  "run_id": "20260420_053218",
+  "run_root": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218",
+  "bronze": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218/delta_tables/bronze/youtube_raw",
+  "silver": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218/delta_tables/silver/youtube_enriched",
+  "gold": {
+    "latest_snapshot": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218/delta_tables/gold/latest_snapshot",
+    "category_summary": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218/delta_tables/gold/category_summary",
+    "views_timeseries": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218/delta_tables/gold/views_timeseries",
+    "region_timeseries": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218/delta_tables/gold/region_timeseries",
+    "channel_leaderboard": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218/delta_tables/gold/channel_leaderboard"
+  },
+  "checkpoint": "/Users/ashutoshsingh/Documents/AI528/storage/runs/20260420_053218/checkpoints/medallion"
+}

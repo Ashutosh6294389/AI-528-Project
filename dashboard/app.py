@@ -10,7 +10,10 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, expr
+from pyspark.sql.types import TimestampType
 
+from spark_processing.storage_paths import get_active_run_paths
 from analytics.business_analysis import (
     prepare_dashboard_df,
     build_category_summary,
@@ -58,12 +61,30 @@ from analytics.business_analysis import (
     build_regional_expansion_recommendations,
 )
 
-
-DELTA_PATH = "storage/delta_tables/youtube_enriched"
+RUN_PATHS = get_active_run_paths()
+SILVER_DELTA_PATH = RUN_PATHS["silver"] if RUN_PATHS else ""
+GOLD_LATEST_SNAPSHOT_PATH = RUN_PATHS["gold"]["latest_snapshot"] if RUN_PATHS else ""
+GOLD_CATEGORY_SUMMARY_PATH = RUN_PATHS["gold"]["category_summary"] if RUN_PATHS else ""
+GOLD_VIEWS_TIMESERIES_PATH = RUN_PATHS["gold"]["views_timeseries"] if RUN_PATHS else ""
+GOLD_REGION_TIMESERIES_PATH = RUN_PATHS["gold"]["region_timeseries"] if RUN_PATHS else ""
+GOLD_CHANNEL_LEADERBOARD_PATH = RUN_PATHS["gold"]["channel_leaderboard"] if RUN_PATHS else ""
 
 st.set_page_config(page_title="Business-Ready YouTube Analytics", layout="wide")
 st.title("YouTube Business Analytics Dashboard")
 st.caption("Descriptive, diagnostic, predictive, and prescriptive analytics for trending YouTube content")
+
+if RUN_PATHS is None:
+    st.warning("No active medallion run found. Run backfill or streaming first.")
+    st.stop()
+
+
+def _safe_pandas_from_spark(sdf):
+    timestamp_columns = [
+        field.name for field in sdf.schema.fields if isinstance(field.dataType, TimestampType)
+    ]
+    for column_name in timestamp_columns:
+        sdf = sdf.withColumn(column_name, col(column_name).cast("string"))
+    return sdf.toPandas()
 
 
 @st.cache_resource(show_spinner=False)
@@ -87,59 +108,176 @@ def get_spark():
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_data():
+def load_optional_delta(path: str):
     try:
-        if not os.path.exists(DELTA_PATH):
+        if not os.path.exists(path):
             return pd.DataFrame()
 
         spark = get_spark()
-        sdf = spark.read.format("delta").load(DELTA_PATH)
+        sdf = spark.read.format("delta").load(path)
 
-        if sdf.rdd.isEmpty():
+        if sdf.limit(1).count() == 0:
             return pd.DataFrame()
 
-        return sdf.toPandas()
+        return _safe_pandas_from_spark(sdf)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_silver_filtered(selected_category: str, selected_region: str, history_window: str):
+    try:
+        if not os.path.exists(SILVER_DELTA_PATH):
+            return pd.DataFrame()
+
+        spark = get_spark()
+        sdf = spark.read.format("delta").load(SILVER_DELTA_PATH)
+
+        if selected_category != "All":
+            sdf = sdf.filter(col("category_name") == selected_category)
+
+        if selected_region != "All":
+            sdf = sdf.filter(col("trending_region") == selected_region)
+
+        window_days = {
+            "Last 24 Hours": 1,
+            "Last 7 Days": 7,
+            "Last 30 Days": 30,
+            "All Available": None,
+        }
+        days = window_days[history_window]
+        if days is not None and "collected_at_ts" in sdf.columns:
+            sdf = sdf.filter(col("collected_at_ts") >= expr(f"current_timestamp() - INTERVAL {days} DAYS"))
+
+        if sdf.limit(1).count() == 0:
+            return pd.DataFrame()
+
+        dashboard_columns = [
+            "collection_batch_id",
+            "collected_at",
+            "collected_at_ts",
+            "surface",
+            "trending_region",
+            "trending_category_id",
+            "trending_page",
+            "trending_rank",
+            "video_id",
+            "title",
+            "description",
+            "published_at",
+            "published_at_ts",
+            "category_id",
+            "category_name",
+            "tags",
+            "default_language",
+            "thumbnail_url",
+            "view_count",
+            "like_count",
+            "comment_count",
+            "favorite_count",
+            "duration_iso",
+            "definition",
+            "caption",
+            "licensed_content",
+            "content_rating",
+            "projection",
+            "channel_id",
+            "channel_title",
+            "channel_subscriber_count",
+            "channel_view_count",
+            "channel_video_count",
+            "channel_country",
+            "engagements",
+            "like_rate",
+            "comment_rate",
+            "engagement_rate",
+            "video_age_hours",
+            "velocity",
+            "title_word_count",
+            "title_has_question",
+            "title_has_number",
+            "title_caps_ratio",
+            "tags_array",
+            "tag_count",
+            "duration_seconds",
+            "duration_bucket",
+            "publish_day",
+            "publish_hour",
+            "time_bucket",
+        ]
+        available_columns = [name for name in dashboard_columns if name in sdf.columns]
+        sdf = sdf.select(*available_columns)
+
+        return _safe_pandas_from_spark(sdf)
     except Exception as exc:
         st.error(f"Could not load Delta data: {exc}")
         return pd.DataFrame()
 
 
-raw_df = load_data()
-df = prepare_dashboard_df(raw_df)
-
-if df.empty:
-    st.warning("No data available. Run the producer and Spark streaming first.")
-    st.stop()
+gold_latest_snapshot_df = load_optional_delta(GOLD_LATEST_SNAPSHOT_PATH)
+gold_category_summary_df = load_optional_delta(GOLD_CATEGORY_SUMMARY_PATH)
+gold_views_timeseries_df = load_optional_delta(GOLD_VIEWS_TIMESERIES_PATH)
+gold_region_timeseries_df = load_optional_delta(GOLD_REGION_TIMESERIES_PATH)
+gold_channel_leaderboard_df = load_optional_delta(GOLD_CHANNEL_LEADERBOARD_PATH)
 
 st.sidebar.header("Filters")
 
-category_options = ["All"] + sorted(df["category_name"].dropna().astype(str).unique().tolist())
-region_options = ["All"] + sorted(df["trending_region"].dropna().astype(str).unique().tolist())
+filter_source_df = gold_latest_snapshot_df if not gold_latest_snapshot_df.empty else load_optional_delta(SILVER_DELTA_PATH)
+
+if filter_source_df.empty:
+    st.warning("No data available. Run the producer and Spark streaming first.")
+    st.stop()
+
+category_options = ["All"] + sorted(filter_source_df["category_name"].dropna().astype(str).unique().tolist())
+region_options = ["All"] + sorted(filter_source_df["trending_region"].dropna().astype(str).unique().tolist())
 
 selected_category = st.sidebar.selectbox("Category", category_options)
 selected_region = st.sidebar.selectbox("Region", region_options)
+history_window = st.sidebar.selectbox(
+    "Silver History Window",
+    ["Last 24 Hours", "Last 7 Days", "Last 30 Days", "All Available"],
+    index=2,
+    help="Gold tables still use full history. This window limits only detailed Silver-level computations.",
+)
 
-if selected_category != "All":
-    df = df[df["category_name"] == selected_category]
+raw_df = load_silver_filtered(selected_category, selected_region, history_window)
+df = prepare_dashboard_df(raw_df)
 
-if selected_region != "All":
-    df = df[df["trending_region"] == selected_region]
-
-if df.empty:
-    st.warning("No data matched the selected filters.")
+if df.empty and filter_source_df.empty:
+    st.warning("No data available. Run the producer and Spark streaming first.")
     st.stop()
 
-summary_df = build_category_summary(df)
+if df.empty:
+    st.warning("No Silver data matched the selected filters/window. Gold summary tables may still populate some charts.")
+    st.stop()
+
+use_gold_category_summary = (
+    not gold_category_summary_df.empty and selected_region == "All" and selected_category == "All"
+)
+summary_df = gold_category_summary_df if use_gold_category_summary else build_category_summary(df)
 top_videos_df = build_top_videos(df)
 diagnostic_df = build_diagnostic_table(df)
 forecast_df = build_forecast(df)
 recommendations_df = build_recommendations(df)
 
-views_ts_df = build_views_timeseries(df)
-region_ts_df = build_region_timeseries(df)
+use_gold_views_ts = (
+    not gold_views_timeseries_df.empty and selected_region == "All" and selected_category == "All"
+)
+views_ts_df = gold_views_timeseries_df if use_gold_views_ts else build_views_timeseries(df)
+
+if not gold_region_timeseries_df.empty and selected_category == "All":
+    region_ts_df = gold_region_timeseries_df.copy()
+    if selected_region != "All":
+        region_ts_df = region_ts_df[region_ts_df["trending_region"] == selected_region]
+else:
+    region_ts_df = build_region_timeseries(df)
+
 publish_heatmap_df = build_publish_hour_heatmap(df)
 category_share_df = build_category_share_over_time(df)
-channel_board_df = build_channel_leaderboard(df)
+use_gold_channel_board = (
+    not gold_channel_leaderboard_df.empty and selected_region == "All" and selected_category == "All"
+)
+channel_board_df = gold_channel_leaderboard_df if use_gold_channel_board else build_channel_leaderboard(df)
 bubble_df = build_bubble_dataset(df)
 outlier_df = build_outlier_videos(df)
 growth_df = build_category_growth(df)
@@ -178,9 +316,14 @@ campaign_alerts_df = build_campaign_timing_alerts(df)
 regional_expansion_df = build_regional_expansion_recommendations(df)
 
 
-
-
-latest_records = df.sort_values("collected_at").drop_duplicates(subset=["video_id", "trending_region"], keep="last")
+if not gold_latest_snapshot_df.empty:
+    latest_records = gold_latest_snapshot_df.copy()
+    if selected_category != "All":
+        latest_records = latest_records[latest_records["category_name"] == selected_category]
+    if selected_region != "All":
+        latest_records = latest_records[latest_records["trending_region"] == selected_region]
+else:
+    latest_records = df.sort_values("collected_at").drop_duplicates(subset=["video_id", "trending_region"], keep="last")
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Unique Videos", f"{latest_records['video_id'].nunique():,}")
@@ -1152,5 +1295,5 @@ with st.expander("Raw Data"):
 
 import time
 
-time.sleep(30)
+time.sleep(10)
 st.rerun()
