@@ -1,84 +1,58 @@
-0. CLEAN START (optional but recommended)
-pkill -f kafka
-pkill -f java
-⚙️ 1. ACTIVATE ENVIRONMENT
+1. Activate the environment
+
+```bash
 cd ~/Downloads/AI528
 source venv/bin/activate
-☕ 2. SET JAVA (VERY IMPORTANT)
 export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 export PATH=$JAVA_HOME/bin:$PATH
+```
 
-Verify:
+2. Start Kafka
 
-java -version
-🟡 3. START KAFKA (Terminal 1)
+```bash
 /opt/homebrew/opt/kafka/bin/kafka-server-start /opt/homebrew/etc/kafka/server.properties
+```
 
-👉 Keep this running
+3. Create the topic once
 
-🟡 4. CREATE TOPIC (Terminal 2 — run once)
+```bash
 /opt/homebrew/opt/kafka/bin/kafka-topics \
---create \
---topic youtube-data \
---bootstrap-server localhost:9092 \
---partitions 1 \
---replication-factor 1
+  --create \
+  --topic youtube-data \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 1
+```
 
-👉 If "already exists" → ignore
+4. Run the producer
 
-🟡 5. RUN PRODUCER (Terminal 2)
+```bash
 python3 data_ingestion/youtube_producer.py
+```
 
+5. Run the Spark medallion pipeline
 
-
-rm -rf ~/.ivy2
-rm -rf ~/.cache
-rm -rf ~/spark-warehouse
-
-rm -rf storage/checkpoints_csv 
-
-rm -rf storage/output   
-
-👉 This starts sending data to Kafka
-
-🔵 6. RUN SPARK STREAMING (Terminal 3)
+```bash
 python3 spark_processing/spark_streaming.py
-🎯 DONE — PIPELINE RUNNING
+```
 
+6. Open the dashboard
+
+```bash
 streamlit run dashboard/app.py
+```
 
-Flow:
+Current medallion layout
 
-Producer → Kafka → Spark Streaming → Output
-⚠️ TROUBLESHOOT QUICK FIXES
-❌ Kafka not starting
-pkill -f kafka
-pkill -f java
-❌ Port busy (9092)
-lsof -i :9092
-kill -9 <PID>
-❌ Spark Java error
-export JAVA_HOME=$(/usr/libexec/java_home -v 17)
-❌ Producer error (NoBrokersAvailable)
+- Bronze: `storage/delta_tables/bronze/youtube_raw`
+- Silver: `storage/delta_tables/silver/youtube_enriched`
+- Gold: `storage/delta_tables/gold/*`
+- Streaming checkpoint: `storage/checkpoints_medallion`
 
-👉 Kafka is not running → start Step 3
+Persistence behavior
 
-🔥 OPTIONAL (RESET EVERYTHING)
-
-If things break:
-
-rm -rf ~/.ivy2 ~/.cache ~/spark-warehouse
-🚀 ONE-LINE QUICK START (ADVANCED)
-
-If everything is already configured:
-
-source venv/bin/activate && export JAVA_HOME=$(/usr/libexec/java_home -v 17)
-
-Then open 3 terminals and run steps 3–6.
-
-🎉 YOU ARE NOW FULLY SET
-
-Your system is now:
-✔ Stable
-✔ Repeatable
-✔ Production-like
+- Bronze is append-only and keeps raw historical records.
+- Silver appends cleansed records and preserves ingestion metadata.
+- Gold tables are rebuilt from Silver so dashboards always reflect the latest full history.
+- The pipeline no longer creates a new run folder on each start.
+- Do not delete `storage/checkpoints_medallion` unless you intentionally want Spark to replay Kafka data.

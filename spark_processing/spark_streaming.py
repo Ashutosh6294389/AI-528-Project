@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json
+from pyspark.sql.functions import col, current_timestamp, from_json, lit
 from pyspark.sql.types import (
     BooleanType,
     IntegerType,
@@ -8,17 +8,17 @@ from pyspark.sql.types import (
     StructType,
 )
 
-from storage_paths import create_new_active_run
+from storage_paths import ensure_medallion_paths
 from transformations import build_silver_df, refresh_gold_tables
 
 
 KAFKA_BROKER = "localhost:9092"
 TOPIC = "youtube-data"
-RUN_PATHS = create_new_active_run(delete_older_runs=True)
-BRONZE_PATH = RUN_PATHS["bronze"]
-SILVER_PATH = RUN_PATHS["silver"]
-GOLD_PATHS = RUN_PATHS["gold"]
-CHECKPOINT_PATH = RUN_PATHS["checkpoint"]
+MEDALLION_PATHS = ensure_medallion_paths()
+BRONZE_PATH = MEDALLION_PATHS["bronze"]
+SILVER_PATH = MEDALLION_PATHS["silver"]
+GOLD_PATHS = MEDALLION_PATHS["gold"]
+CHECKPOINT_PATH = MEDALLION_PATHS["checkpoint"]
 
 
 spark = (
@@ -82,7 +82,12 @@ def process_batch(batch_df, batch_id: int) -> None:
     if batch_df.isEmpty():
         return
 
-    parsed_batch = batch_df.persist()
+    parsed_batch = (
+        batch_df.withColumn("ingestion_timestamp", current_timestamp())
+        .withColumn("source_system", lit("kafka.youtube-data"))
+        .withColumn("file_name", lit(TOPIC))
+        .persist()
+    )
 
     parsed_batch.write.format("delta").mode("append").save(BRONZE_PATH)
 
@@ -92,7 +97,7 @@ def process_batch(batch_df, batch_id: int) -> None:
     refresh_gold_tables(spark, SILVER_PATH, GOLD_PATHS)
 
     parsed_batch.unpersist()
-    print(f"Processed batch {batch_id}: bronze, silver, and gold layers refreshed.")
+    print(f"Processed batch {batch_id}: bronze appended, silver refreshed, gold refreshed.")
 
 
 kafka_df = (
@@ -116,5 +121,5 @@ query = (
     .start()
 )
 
-print(f"Spark streaming started for run {RUN_PATHS['run_id']}. Writing Bronze/Silver/Gold Delta layers...")
+print("Spark streaming started. Writing to persistent Bronze/Silver/Gold Delta tables...")
 query.awaitTermination()

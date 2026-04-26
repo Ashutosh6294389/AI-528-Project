@@ -5,8 +5,8 @@ from pyspark.sql.functions import (
     col,
     count,
     countDistinct,
+    current_timestamp,
     expr,
-    from_json,
     length,
     lit,
     regexp_extract,
@@ -17,9 +17,9 @@ from pyspark.sql.functions import (
     sum as spark_sum,
     to_timestamp,
     trim,
+    upper,
     when,
 )
-from pyspark.sql.types import ArrayType, StringType
 from pyspark.sql.window import Window
 
 
@@ -27,11 +27,22 @@ DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 
 
 def build_silver_df(df: DataFrame) -> DataFrame:
-    tags_array = from_json(col("tags"), ArrayType(StringType()))
-
     silver_df = (
         df.withColumn("collected_at_ts", to_timestamp("collected_at"))
         .withColumn("published_at_ts", to_timestamp("published_at"))
+        .withColumn(
+            "ingestion_timestamp",
+            when(col("ingestion_timestamp").isNotNull(), col("ingestion_timestamp").cast("timestamp"))
+            .otherwise(current_timestamp()),
+        )
+        .withColumn("source_system", when(col("source_system").isNull(), lit("unknown")).otherwise(col("source_system")))
+        .withColumn("file_name", when(col("file_name").isNull(), lit("stream")).otherwise(col("file_name")))
+        .withColumn("video_id", trim(col("video_id")))
+        .withColumn("title", trim(col("title")))
+        .withColumn("channel_id", trim(col("channel_id")))
+        .withColumn("channel_title", trim(col("channel_title")))
+        .withColumn("trending_region", upper_trimmed("trending_region"))
+        .withColumn("category_name", trim(col("category_name")))
         .withColumn("view_count", col("view_count").cast("int"))
         .withColumn("like_count", col("like_count").cast("int"))
         .withColumn("comment_count", col("comment_count").cast("int"))
@@ -88,9 +99,21 @@ def build_silver_df(df: DataFrame) -> DataFrame:
         .withColumn("publish_day", expr("date_format(published_at_ts, 'EEEE')"))
         .withColumn("publish_hour", expr("hour(published_at_ts)"))
         .withColumn("time_bucket", expr("to_timestamp(from_unixtime(floor(unix_timestamp(collected_at_ts) / 300) * 300))"))
+        .where(col("video_id").isNotNull() & (col("video_id") != ""))
+        .where(col("collected_at_ts").isNotNull())
     )
 
-    return silver_df
+    dedupe_window = Window.partitionBy(
+        "collection_batch_id",
+        "trending_region",
+        "video_id",
+    ).orderBy(col("ingestion_timestamp").desc())
+
+    return (
+        silver_df.withColumn("rn", row_number().over(dedupe_window))
+        .where(col("rn") == 1)
+        .drop("rn")
+    )
 
 
 def build_gold_latest_snapshot(silver_df: DataFrame) -> DataFrame:
@@ -173,3 +196,7 @@ def duration_to_seconds_expr(column_name: str):
 
 def coalesce_int(column):
     return when(column == "", lit(0)).otherwise(column.cast("int"))
+
+
+def upper_trimmed(column_name: str):
+    return upper(trim(col(column_name)))

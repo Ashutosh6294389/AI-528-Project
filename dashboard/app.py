@@ -13,7 +13,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, expr
 from pyspark.sql.types import TimestampType
 
-from spark_processing.storage_paths import get_active_run_paths
+from spark_processing.storage_paths import get_medallion_paths
 from analytics.business_analysis import (
     prepare_dashboard_df,
     build_category_summary,
@@ -61,22 +61,19 @@ from analytics.business_analysis import (
     build_regional_expansion_recommendations,
 )
 
-RUN_PATHS = get_active_run_paths()
-SILVER_DELTA_PATH = RUN_PATHS["silver"] if RUN_PATHS else ""
-GOLD_LATEST_SNAPSHOT_PATH = RUN_PATHS["gold"]["latest_snapshot"] if RUN_PATHS else ""
-GOLD_CATEGORY_SUMMARY_PATH = RUN_PATHS["gold"]["category_summary"] if RUN_PATHS else ""
-GOLD_VIEWS_TIMESERIES_PATH = RUN_PATHS["gold"]["views_timeseries"] if RUN_PATHS else ""
-GOLD_REGION_TIMESERIES_PATH = RUN_PATHS["gold"]["region_timeseries"] if RUN_PATHS else ""
-GOLD_CHANNEL_LEADERBOARD_PATH = RUN_PATHS["gold"]["channel_leaderboard"] if RUN_PATHS else ""
+MEDALLION_PATHS = get_medallion_paths()
+SILVER_DELTA_PATH = MEDALLION_PATHS["silver"]
+GOLD_LATEST_SNAPSHOT_PATH = MEDALLION_PATHS["gold"]["latest_snapshot"]
+GOLD_CATEGORY_SUMMARY_PATH = MEDALLION_PATHS["gold"]["category_summary"]
+GOLD_VIEWS_TIMESERIES_PATH = MEDALLION_PATHS["gold"]["views_timeseries"]
+GOLD_REGION_TIMESERIES_PATH = MEDALLION_PATHS["gold"]["region_timeseries"]
+GOLD_CHANNEL_LEADERBOARD_PATH = MEDALLION_PATHS["gold"]["channel_leaderboard"]
+MAX_DASHBOARD_ROWS = 50000
+DEFAULT_HISTORY_WINDOW_INDEX = 1
 
 st.set_page_config(page_title="Business-Ready YouTube Analytics", layout="wide")
 st.title("YouTube Business Analytics Dashboard")
 st.caption("Descriptive, diagnostic, predictive, and prescriptive analytics for trending YouTube content")
-
-if RUN_PATHS is None:
-    st.warning("No active medallion run found. Run backfill or streaming first.")
-    st.stop()
-
 
 def _safe_pandas_from_spark(sdf):
     timestamp_columns = [
@@ -94,6 +91,8 @@ def get_spark():
         .master("local[*]")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.driver.memory", "4g")
+        .config("spark.executor.memory", "4g")
         .config(
             "spark.jars",
             "jars/delta-core_2.12-2.4.0.jar,"
@@ -108,7 +107,7 @@ def get_spark():
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_optional_delta(path: str):
+def load_optional_delta(path: str, max_rows: int | None = None):
     try:
         if not os.path.exists(path):
             return pd.DataFrame()
@@ -119,6 +118,9 @@ def load_optional_delta(path: str):
         if sdf.limit(1).count() == 0:
             return pd.DataFrame()
 
+        if max_rows is not None:
+            sdf = sdf.limit(max_rows)
+
         return _safe_pandas_from_spark(sdf)
     except Exception:
         return pd.DataFrame()
@@ -128,7 +130,7 @@ def load_optional_delta(path: str):
 def load_silver_filtered(selected_category: str, selected_region: str, history_window: str):
     try:
         if not os.path.exists(SILVER_DELTA_PATH):
-            return pd.DataFrame()
+            return pd.DataFrame(), False
 
         spark = get_spark()
         sdf = spark.read.format("delta").load(SILVER_DELTA_PATH)
@@ -150,7 +152,7 @@ def load_silver_filtered(selected_category: str, selected_region: str, history_w
             sdf = sdf.filter(col("collected_at_ts") >= expr(f"current_timestamp() - INTERVAL {days} DAYS"))
 
         if sdf.limit(1).count() == 0:
-            return pd.DataFrame()
+            return pd.DataFrame(), False
 
         dashboard_columns = [
             "collection_batch_id",
@@ -207,10 +209,39 @@ def load_silver_filtered(selected_category: str, selected_region: str, history_w
         ]
         available_columns = [name for name in dashboard_columns if name in sdf.columns]
         sdf = sdf.select(*available_columns)
+        if "collected_at_ts" in sdf.columns:
+            sdf = sdf.orderBy(col("collected_at_ts").desc())
 
-        return _safe_pandas_from_spark(sdf)
+        truncated = False
+        if sdf.limit(MAX_DASHBOARD_ROWS + 1).count() > MAX_DASHBOARD_ROWS:
+            sdf = sdf.limit(MAX_DASHBOARD_ROWS)
+            truncated = True
+
+        return _safe_pandas_from_spark(sdf), truncated
     except Exception as exc:
         st.error(f"Could not load Delta data: {exc}")
+        return pd.DataFrame(), False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_filter_source():
+    if not gold_latest_snapshot_df.empty:
+        return gold_latest_snapshot_df
+
+    try:
+        if not os.path.exists(SILVER_DELTA_PATH):
+            return pd.DataFrame()
+
+        spark = get_spark()
+        sdf = (
+            spark.read.format("delta").load(SILVER_DELTA_PATH)
+            .select("category_name", "trending_region")
+            .dropna(subset=["category_name", "trending_region"])
+            .distinct()
+            .orderBy("category_name", "trending_region")
+        )
+        return _safe_pandas_from_spark(sdf)
+    except Exception:
         return pd.DataFrame()
 
 
@@ -222,7 +253,7 @@ gold_channel_leaderboard_df = load_optional_delta(GOLD_CHANNEL_LEADERBOARD_PATH)
 
 st.sidebar.header("Filters")
 
-filter_source_df = gold_latest_snapshot_df if not gold_latest_snapshot_df.empty else load_optional_delta(SILVER_DELTA_PATH)
+filter_source_df = load_filter_source()
 
 if filter_source_df.empty:
     st.warning("No data available. Run the producer and Spark streaming first.")
@@ -236,12 +267,18 @@ selected_region = st.sidebar.selectbox("Region", region_options)
 history_window = st.sidebar.selectbox(
     "Silver History Window",
     ["Last 24 Hours", "Last 7 Days", "Last 30 Days", "All Available"],
-    index=2,
+    index=DEFAULT_HISTORY_WINDOW_INDEX,
     help="Gold tables still use full history. This window limits only detailed Silver-level computations.",
 )
 
-raw_df = load_silver_filtered(selected_category, selected_region, history_window)
+raw_df, silver_truncated = load_silver_filtered(selected_category, selected_region, history_window)
 df = prepare_dashboard_df(raw_df)
+
+if silver_truncated:
+    st.info(
+        f"Detailed Silver analysis is capped to the most recent {MAX_DASHBOARD_ROWS:,} rows for dashboard stability. "
+        "Gold summary tables still use the full Silver history."
+    )
 
 if df.empty and filter_source_df.empty:
     st.warning("No data available. Run the producer and Spark streaming first.")

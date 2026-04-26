@@ -1,14 +1,15 @@
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, lit
 
-from storage_paths import create_new_active_run
+from storage_paths import ensure_medallion_paths
 from transformations import build_silver_df, refresh_gold_tables
 
 
 SOURCE_PATH = "storage/delta_tables/youtube_enriched"
-RUN_PATHS = create_new_active_run(delete_older_runs=True)
-BRONZE_PATH = RUN_PATHS["bronze"]
-SILVER_PATH = RUN_PATHS["silver"]
-GOLD_PATHS = RUN_PATHS["gold"]
+MEDALLION_PATHS = ensure_medallion_paths()
+BRONZE_PATH = MEDALLION_PATHS["bronze"]
+SILVER_PATH = MEDALLION_PATHS["silver"]
+GOLD_PATHS = MEDALLION_PATHS["gold"]
 
 
 spark = (
@@ -32,14 +33,19 @@ spark = (
 
 def main():
     source_df = spark.read.format("delta").load(SOURCE_PATH)
+    bronze_df = (
+        source_df.withColumn("ingestion_timestamp", current_timestamp())
+        .withColumn("source_system", lit("delta.backfill"))
+        .withColumn("file_name", lit("storage/delta_tables/youtube_enriched"))
+    )
 
-    source_df.write.format("delta").mode("overwrite").save(BRONZE_PATH)
+    bronze_df.write.format("delta").mode("append").option("mergeSchema", "true").save(BRONZE_PATH)
 
-    silver_df = build_silver_df(source_df)
-    silver_df.write.format("delta").mode("overwrite").option("mergeSchema", "true").save(SILVER_PATH)
+    silver_df = build_silver_df(bronze_df)
+    silver_df.write.format("delta").mode("append").option("mergeSchema", "true").save(SILVER_PATH)
 
     refresh_gold_tables(spark, SILVER_PATH, GOLD_PATHS)
-    print(f"Backfill complete for run {RUN_PATHS['run_id']}: Bronze, Silver, and Gold layers are ready.")
+    print("Backfill complete: Bronze appended, Silver appended, Gold refreshed.")
 
 
 if __name__ == "__main__":
