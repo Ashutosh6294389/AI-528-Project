@@ -1,0 +1,14 @@
+pyspark==3.4.1
+delta-spark==2.4.0
+kafka-python==2.0.2
+streamlit==1.44.1
+altair==5.5.0
+pandas==2.2.3
+scikit-learn==1.6.1
+numpy==2.2.4
+pyarrow==19.0.1
+matplotlib==3.10.1
+plotly==6.0.1
+requests==2.32.3
+google-api-python-client==2.169.0
+python-dotenv==1.1.0
