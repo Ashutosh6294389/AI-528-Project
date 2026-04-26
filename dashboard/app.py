@@ -399,7 +399,7 @@ with tab1:
     #     )
     #     .properties(height=350)
     # )
-    # st.altair_chart(category_chart, width="stretch")
+    # st.altair_chart(category_chart, use_container_width=True)
 
     st.subheader("Views Trend Over Time by Category")
     st.markdown("Analytical question: Which categories are sustaining momentum over time?")
@@ -423,7 +423,7 @@ with tab1:
             )
             .properties(height=350)
         )
-        st.altair_chart(views_line, width="stretch")
+        st.altair_chart(views_line, use_container_width=True)
 
     # st.subheader("Category Share of Total Views Over Time")
     # st.markdown("Analytical question: How is category dominance changing over time?")
@@ -447,7 +447,7 @@ with tab1:
     #         )
     #         .properties(height=350)
     #     )
-    #     st.altair_chart(area_chart, width="stretch")
+    #     st.altair_chart(area_chart, use_container_width=True)
     
     st.subheader("Engagement Rate Heatmap (Category x Region)")
     st.markdown("Analytical question: Which category-region combinations show the strongest engagement?")
@@ -473,7 +473,7 @@ with tab1:
             )
             .properties(height=400)
         )
-        st.altair_chart(er_heatmap, width="stretch")
+        st.altair_chart(er_heatmap, use_container_width=True)
 
     st.subheader("Video Duration Distribution")
     st.markdown("Analytical question: Which duration buckets are most common and which perform better?")
@@ -499,7 +499,7 @@ with tab1:
             )
             .properties(height=400)
         )
-        st.altair_chart(duration_chart, width="stretch")
+        st.altair_chart(duration_chart, use_container_width=True)
 
     st.subheader("Channel Subscriber Size Distribution")
     st.markdown("Analytical question: Are trending videos dominated by mega channels or smaller creators?")
@@ -523,7 +523,7 @@ with tab1:
             )
             .properties(height=400)
         )
-        st.altair_chart(subscriber_chart, width="stretch")
+        st.altair_chart(subscriber_chart, use_container_width=True)
 
     st.subheader("Top Tag Usage Frequency")
     st.markdown("Analytical question: Which tags appear most often in trending videos?")
@@ -547,7 +547,7 @@ with tab1:
             )
             .properties(height=500)
         )
-        st.altair_chart(tag_chart, width="stretch")
+        st.altair_chart(tag_chart, use_container_width=True)
 
 
     st.subheader("HD vs SD Distribution")
@@ -573,7 +573,7 @@ with tab1:
             )
             .properties(height=400)
         )
-        st.altair_chart(hd_sd_chart, width="stretch")
+        st.altair_chart(hd_sd_chart, use_container_width=True)
 
     
     st.subheader("Caption / Subtitle Availability Rate")
@@ -599,7 +599,7 @@ with tab1:
             )
             .properties(height=450)
         )
-        st.altair_chart(caption_chart, width="stretch")
+        st.altair_chart(caption_chart, use_container_width=True)
 
 
     st.subheader("Trending Rank Distribution by Category")
@@ -624,7 +624,7 @@ with tab1:
             )
             .properties(height=450)
         )
-        st.altair_chart(trending_dist_chart, width="stretch")
+        st.altair_chart(trending_dist_chart, use_container_width=True)
 
 
     st.subheader("Top Channels Leaderboard")
@@ -651,7 +651,7 @@ with tab1:
             )
             .properties(height=450)
         )
-        st.altair_chart(channel_chart, width="stretch")
+        st.altair_chart(channel_chart, use_container_width=True)
 
     st.subheader("Top Trending Videos Leaderboard")
     st.markdown("Analytical question: Which videos are leading the current trending batch right now?")
@@ -676,7 +676,7 @@ with tab1:
                     "title": "Title",
                 }
             ),
-            width="stretch",
+            use_container_width=True,
         )
 
 
@@ -710,7 +710,7 @@ with tab2:
             )
             .properties(height=500)
         )
-        st.altair_chart(velocity_chart, width="stretch")
+        st.altair_chart(velocity_chart, use_container_width=True)
 
     st.subheader("Trending Persistence Tracking")
     st.markdown("Mode 3: Full time-series. Which videos stay in trending for the longest duration?")
@@ -737,7 +737,7 @@ with tab2:
             )
             .properties(height=500)
         )
-        st.altair_chart(persistence_chart, width="stretch")
+        st.altair_chart(persistence_chart, use_container_width=True)
 
     st.subheader("Rank Movement Analysis")
     st.markdown("Mode 3: Full time-series. How is trending rank changing over consecutive batches?")
@@ -764,7 +764,7 @@ with tab2:
             )
             .properties(height=450)
         )
-        st.altair_chart(rank_chart, width="stretch")
+        st.altair_chart(rank_chart, use_container_width=True)
 
     st.subheader("Engagement vs View Count Correlation")
     st.markdown("Latest snapshot scatter plus category-region correlation scores.")
@@ -790,10 +790,10 @@ with tab2:
             )
             .properties(height=450)
         )
-        st.altair_chart(corr_chart, width="stretch")
+        st.altair_chart(corr_chart, use_container_width=True)
 
         if not corr_df.empty:
-            st.dataframe(corr_df, width="stretch")
+            st.dataframe(corr_df, use_container_width=True)
 
     st.subheader("Title Characteristics vs Performance")
     st.markdown("Mode 2: Deduplicated historical. Which title patterns are associated with stronger performance?")
@@ -822,7 +822,7 @@ with tab2:
             )
             .properties(height=350)
         )
-        st.altair_chart(title_chart, width="stretch")
+        st.altair_chart(title_chart, use_container_width=True)
 
     st.subheader("Tag Count vs Engagement")
     st.markdown("Mode 2: Deduplicated historical. Does having more tags relate to stronger engagement?")
@@ -846,7 +846,7 @@ with tab2:
             )
             .properties(height=400)
         )
-        st.altair_chart(tag_chart, width="stretch")
+        st.altair_chart(tag_chart, use_container_width=True)
 
     st.subheader("Duration vs Engagement Relationship")
     st.markdown("Mode 2: Deduplicated historical. Which duration buckets perform best?")
@@ -874,7 +874,7 @@ with tab2:
             )
             .properties(height=400)
         )
-        st.altair_chart(duration_chart, width="stretch")
+        st.altair_chart(duration_chart, use_container_width=True)
 
     st.subheader("Channel Size vs Trending Reach")
     st.markdown("Mode 2: Deduplicated historical. How does creator size relate to trending reach?")
@@ -900,7 +900,7 @@ with tab2:
             )
             .properties(height=400)
         )
-        st.altair_chart(channel_size_chart, width="stretch")
+        st.altair_chart(channel_size_chart, use_container_width=True)
 
     st.subheader("Regional Content Preference Divergence")
     st.markdown("Latest snapshot. Which regions over-index or under-index on certain categories versus the global mix?")
@@ -924,7 +924,7 @@ with tab2:
             )
             .properties(height=450)
         )
-        st.altair_chart(divergence_chart, width="stretch")
+        st.altair_chart(divergence_chart, use_container_width=True)
 
     st.subheader("Recency Bias Detection")
     st.markdown("Mode 2: Deduplicated historical. How old are videos when they first enter trending?")
@@ -947,7 +947,7 @@ with tab2:
             )
             .properties(height=400)
         )
-        st.altair_chart(recency_chart, width="stretch")
+        st.altair_chart(recency_chart, use_container_width=True)
 
     st.subheader("Weekend vs Weekday Trending Behavior")
     st.markdown("Mode 3: Full time-series. Are engagement and views different on weekends vs weekdays?")
@@ -973,7 +973,7 @@ with tab2:
             )
             .properties(height=400)
         )
-        st.altair_chart(weekend_chart, width="stretch")
+        st.altair_chart(weekend_chart, use_container_width=True)
 
 
 with tab3:
@@ -1007,7 +1007,7 @@ with tab3:
             )
             .properties(height=500)
         )
-        st.altair_chart(entry_chart, width="stretch")
+        st.altair_chart(entry_chart, use_container_width=True)
 
     st.subheader("View Count Forecasting")
     st.markdown("Mode 3 per-video forecasting. The graph projects future view counts for currently trending videos with a simple confidence band.")
@@ -1061,7 +1061,7 @@ with tab3:
                 color=alt.Color("title:N", legend=None),
             )
         )
-        st.altair_chart((confidence_band + actual_line + forecast_line).properties(height=450), width="stretch")
+        st.altair_chart((confidence_band + actual_line + forecast_line).properties(height=450), use_container_width=True)
 
     st.subheader("Trending Duration Prediction")
     st.markdown("Historical episodes are used to estimate total trending lifespan and remaining time for the videos in the current batch.")
@@ -1089,7 +1089,7 @@ with tab3:
             )
             .properties(height=500)
         )
-        st.altair_chart(duration_prediction_chart, width="stretch")
+        st.altair_chart(duration_prediction_chart, use_container_width=True)
 
     st.subheader("Peak Rank and Category Forecasting")
     st.markdown("These charts estimate the best future rank a current video may reach and the next category-share trajectory using the accumulated time-series history.")
@@ -1117,7 +1117,7 @@ with tab3:
             )
             .properties(height=450)
         )
-        st.altair_chart(peak_rank_chart, width="stretch")
+        st.altair_chart(peak_rank_chart, use_container_width=True)
 
     if category_share_forecast_df.empty:
         st.info("Category-share forecasting needs at least 2 time buckets per category.")
@@ -1139,7 +1139,7 @@ with tab3:
             )
             .properties(height=400)
         )
-        st.altair_chart(category_share_chart, width="stretch")
+        st.altair_chart(category_share_chart, use_container_width=True)
 
 with tab4:
     st.subheader("4. What should be done?")
@@ -1173,11 +1173,11 @@ with tab4:
             )
             .properties(height=350)
         )
-        st.altair_chart(posting_heatmap, width="stretch")
+        st.altair_chart(posting_heatmap, use_container_width=True)
 
         best_slots = optimal_posting_df[optimal_posting_df["slot_rank"] == 1].copy()
         if not best_slots.empty:
-            st.dataframe(best_slots, width="stretch")
+            st.dataframe(best_slots, use_container_width=True)
 
     st.subheader("Trending Gap Opportunity Detector")
     st.markdown("Latest snapshot versus 7-day baseline. Categories with the biggest deficit are immediate opportunity spaces.")
@@ -1202,7 +1202,7 @@ with tab4:
             )
             .properties(height=400)
         )
-        st.altair_chart(gap_chart, width="stretch")
+        st.altair_chart(gap_chart, use_container_width=True)
 
     st.subheader("Creator Partnership Recommendation Engine")
     st.markdown("Mode 2: Deduplicated historical. This surfaces channels with repeat trending success and strong partnership fit.")
@@ -1228,7 +1228,7 @@ with tab4:
             )
             .properties(height=500)
         )
-        st.altair_chart(partner_chart, width="stretch")
+        st.altair_chart(partner_chart, use_container_width=True)
 
     st.subheader("Format Prescriptions")
     st.markdown("Mode 2: Deduplicated historical. These patterns recommend what kind of packaging performs best by category.")
@@ -1254,7 +1254,7 @@ with tab4:
             )
             .properties(height=500)
         )
-        st.altair_chart(format_chart, width="stretch")
+        st.altair_chart(format_chart, use_container_width=True)
 
     st.subheader("Campaign Timing Alerts")
     st.markdown("Mode 3: Full time-series. This flags videos that should be boosted now, watched closely, or are losing momentum.")
@@ -1281,7 +1281,7 @@ with tab4:
             )
             .properties(height=500)
         )
-        st.altair_chart(alert_chart, width="stretch")
+        st.altair_chart(alert_chart, use_container_width=True)
 
     st.subheader("Regional Expansion Recommendations")
     st.markdown("Mode 2: Deduplicated historical. This estimates which target regions are the strongest next expansion markets.")
@@ -1307,7 +1307,7 @@ with tab4:
             )
             .properties(height=500)
         )
-        st.altair_chart(expansion_chart, width="stretch")
+        st.altair_chart(expansion_chart, use_container_width=True)
 
     st.subheader("Decision Summary")
     if not summary_df.empty:
@@ -1328,7 +1328,7 @@ with tab4:
             )
 
 with st.expander("Raw Data"):
-    st.dataframe(df, width="stretch")
+    st.dataframe(df, use_container_width=True)
 
 import time
 

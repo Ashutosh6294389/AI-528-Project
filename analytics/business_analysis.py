@@ -379,14 +379,19 @@ def build_publish_hour_heatmap(df: pd.DataFrame) -> pd.DataFrame:
     day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     work["publish_day"] = pd.Categorical(work["publish_day"], categories=day_order, ordered=True)
 
-    return (
-        work.groupby(["publish_day", "publish_hour"], as_index=False)
+    heatmap = (
+        work.groupby(["publish_day", "publish_hour"], as_index=False, observed=True)
         .agg(
             avg_views=("view_count", "mean"),
             avg_engagement_rate=("engagement_rate", "mean"),
             videos=("video_id", "nunique"),
         )
     )
+
+    heatmap["publish_day"] = pd.Categorical(
+        heatmap["publish_day"], categories=day_order, ordered=True
+    )
+    return heatmap.sort_values(["publish_day", "publish_hour"]).reset_index(drop=True)
 
 
 def build_category_share_over_time(df: pd.DataFrame) -> pd.DataFrame:
@@ -1472,7 +1477,7 @@ def build_format_prescriptions(df: pd.DataFrame) -> pd.DataFrame:
 
     for feature_col, feature_name in feature_sets:
         grouped = (
-            work.groupby(["category_name", feature_col], as_index=False)
+            work.groupby(["category_name", feature_col], as_index=False, observed=True)
             .agg(
                 avg_er=("engagement_rate", "mean"),
                 avg_views=("view_count", "mean"),

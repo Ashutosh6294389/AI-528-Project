@@ -56,3 +56,8 @@ Persistence behavior
 - Gold tables are rebuilt from Silver so dashboards always reflect the latest full history.
 - The pipeline no longer creates a new run folder on each start.
 - Do not delete `storage/checkpoints_medallion` unless you intentionally want Spark to replay Kafka data.
+
+
+
+
+/opt/homebrew/opt/kafka/bin/kafka-server-start /opt/homebrew/etc/kafka/server.properties
