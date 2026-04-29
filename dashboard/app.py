@@ -15,39 +15,13 @@ from pyspark.sql.types import TimestampType
 
 from spark_processing.storage_paths import get_medallion_paths
 from analytics.business_analysis import (
+    # prepare_dashboard_df normalises raw Silver rows for the predictive /
+    # prescriptive ML pipelines below. Descriptive aggregations no longer
+    # need it because they aggregate in Spark.
     prepare_dashboard_df,
-    build_category_summary,
-    build_top_videos,
-    build_diagnostic_table,
-    build_forecast,
-    build_recommendations,
-    build_views_timeseries,
-    build_region_timeseries,
-    build_publish_hour_heatmap,
-    build_category_share_over_time,
-    build_channel_leaderboard,
-    build_bubble_dataset,
-    build_outlier_videos,
-    build_category_growth,
-    build_comments_vs_views,
-    build_engagement_heatmap,
-    build_duration_distribution,
-    build_subscriber_tier_distribution,
-    build_tag_usage_frequency,
-    build_hd_sd_distribution,
-    build_caption_rate,
-    build_view_velocity,
-    build_trending_persistence,
-    build_rank_movement,
-    build_engagement_vs_views_correlation,
-    build_title_characteristics,
-    build_tag_count_vs_engagement,
-    build_duration_vs_engagement,
-    build_channel_size_vs_reach,
-    build_regional_preference_divergence,
-    build_recency_bias,
-    build_weekend_weekday_behavior,
-    build_trending_rank_distribution,
+    # The following builders are only used by tab 2 (Predictive) and tab 3
+    # (Prescriptive). They wrap sklearn / regression code that operates on
+    # numpy/pandas arrays, so they remain pandas-backed.
     build_trending_entry_probability,
     build_view_count_forecast_v2,
     build_trending_duration_prediction,
@@ -59,6 +33,21 @@ from analytics.business_analysis import (
     build_format_prescriptions,
     build_campaign_timing_alerts,
     build_regional_expansion_recommendations,
+)
+from analytics.predictive_metrics import (
+    evaluate_category_share_forecast,
+    evaluate_peak_rank_forecast,
+    evaluate_trending_duration_prediction,
+    evaluate_trending_entry_probability,
+    evaluate_view_count_forecast,
+)
+from analytics.spark_descriptive import (
+    build_spark_category_summary,
+    build_spark_duration_distribution,
+    build_spark_subscriber_tier_distribution,
+    build_spark_tag_usage_frequency,
+    build_spark_trending_rank_distribution,
+    build_spark_views_timeseries,
 )
 from analytics.spark_diagnostics import (
     build_channel_mix_shift_diagnostic,
@@ -211,6 +200,99 @@ def _explanation(text: str) -> None:
         f"<b>What this chart says:</b> {text}</div>",
         unsafe_allow_html=True,
     )
+
+
+def _model_metrics_strip(label: str, metrics: dict) -> None:
+    """Render a small accuracy strip under a predictive chart.
+
+    `metrics` is the dict returned by an evaluate_* function. If it's empty
+    or missing keys, we render a 'not enough data yet' note so users know
+    why no number is shown.
+    """
+    if not metrics:
+        st.markdown(
+            f"<div style='font-size:0.8rem; color:#94a3b8; "
+            f"background:#f8fafc; padding:0.4rem 0.7rem; "
+            f"border-left:3px solid #cbd5e1; border-radius:4px; "
+            f"margin-top:-0.4rem; margin-bottom:0.6rem;'>"
+            f"<b>{label} accuracy:</b> not enough holdout data yet — "
+            f"keep streaming and the metric will populate.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    parts = []
+    if "auc" in metrics:
+        parts.append(f"ROC-AUC <b>{metrics['auc']:.3f}</b>")
+    if "precision_at_k" in metrics:
+        parts.append(
+            f"Precision@{metrics.get('k', '?')} "
+            f"<b>{metrics['precision_at_k'] * 100:.1f}%</b>"
+        )
+    if "smape_pct" in metrics:
+        parts.append(f"sMAPE <b>{metrics['smape_pct']:.1f}%</b>")
+    if "mae_views" in metrics:
+        parts.append(f"MAE <b>{int(metrics['mae_views']):,}</b> views")
+    if "mae_hours" in metrics:
+        parts.append(
+            f"MAE <b>{metrics['mae_hours']:.2f} h</b> "
+            f"(mean actual {metrics['mean_actual_hours']:.2f} h)"
+        )
+    if "mae_ranks" in metrics:
+        parts.append(f"MAE <b>{metrics['mae_ranks']:.2f} ranks</b>")
+    for k, v in metrics.items():
+        if k.startswith("pct_within_"):
+            n = k.split("_")[-1]
+            parts.append(f"{v:.1f}% within ±{n} ranks")
+    if "mae_share_pct" in metrics:
+        parts.append(f"MAE <b>{metrics['mae_share_pct']:.2f} pp</b> share")
+
+    sample = []
+    if "n_train" in metrics:
+        sample.append(f"train n={metrics['n_train']:,}")
+    if "n_test" in metrics:
+        sample.append(f"test n={metrics['n_test']:,}")
+    if "n_videos" in metrics:
+        sample.append(f"videos held-out={metrics['n_videos']:,}")
+    sample_str = " • ".join(sample) if sample else ""
+
+    body = " • ".join(parts) if parts else "no metric available"
+    if sample_str:
+        body = f"{body}<span style='color:#94a3b8'> &nbsp;|&nbsp; {sample_str}</span>"
+
+    st.markdown(
+        f"<div style='font-size:0.85rem; color:#0f172a; "
+        f"background:#ecfeff; padding:0.5rem 0.75rem; "
+        f"border-left:3px solid #06b6d4; border-radius:4px; "
+        f"margin-top:-0.4rem; margin-bottom:0.6rem;'>"
+        f"<b>{label} accuracy (time-based holdout):</b> {body}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_entry_probability_metrics(_df: pd.DataFrame) -> dict:
+    return evaluate_trending_entry_probability(_df)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_view_forecast_metrics(_df: pd.DataFrame) -> dict:
+    return evaluate_view_count_forecast(_df)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_duration_prediction_metrics(_df: pd.DataFrame) -> dict:
+    return evaluate_trending_duration_prediction(_df)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_peak_rank_metrics(_df: pd.DataFrame) -> dict:
+    return evaluate_peak_rank_forecast(_df)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_category_share_metrics(_df: pd.DataFrame) -> dict:
+    return evaluate_category_share_forecast(_df)
 
 
 def _explain_velocity_shift(df) -> str:
@@ -781,6 +863,109 @@ def load_silver_filtered(selected_category: str, selected_region: str, history_w
         return pd.DataFrame(), False
 
 
+# ---------------------------------------------------------------------------
+# Spark-backed descriptive loaders
+# ---------------------------------------------------------------------------
+# These run their aggregations in Spark against the Silver Delta layer and
+# return a small pandas DataFrame only at the end (so Streamlit/Altair can
+# render). No row-by-row pandas processing happens for descriptive charts.
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_spark_category_summary(category_name, trending_region, history_window):
+    sdf = build_spark_category_summary(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    return _safe_pandas_from_spark(sdf)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_spark_views_timeseries(category_name, trending_region, history_window):
+    sdf = build_spark_views_timeseries(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    return _safe_pandas_from_spark(sdf)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_spark_duration_distribution(category_name, trending_region, history_window):
+    sdf = build_spark_duration_distribution(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    return _safe_pandas_from_spark(sdf)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_spark_subscriber_tier_distribution(category_name, trending_region, history_window):
+    sdf = build_spark_subscriber_tier_distribution(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    return _safe_pandas_from_spark(sdf)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_spark_tag_usage_frequency(category_name, trending_region, history_window):
+    sdf = build_spark_tag_usage_frequency(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    return _safe_pandas_from_spark(sdf)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_spark_trending_rank_distribution(category_name, trending_region, history_window):
+    sdf = build_spark_trending_rank_distribution(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    return _safe_pandas_from_spark(sdf)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_spark_kpis(category_name, trending_region, history_window):
+    """Headline KPIs computed entirely in Spark (no pandas processing)."""
+    spark = get_spark()
+    sdf = spark.read.format("delta").load(SILVER_DELTA_PATH)
+    if category_name:
+        sdf = sdf.filter(col("category_name") == category_name)
+    if trending_region:
+        sdf = sdf.filter(col("trending_region") == trending_region)
+    window_days = {"Last 24 Hours": 1, "Last 7 Days": 7, "Last 30 Days": 30, "All Available": None}
+    days = window_days.get(history_window)
+    if days is not None and "collected_at_ts" in sdf.columns:
+        sdf = sdf.filter(col("collected_at_ts") >= expr(f"current_timestamp() - INTERVAL {days} DAYS"))
+
+    # Latest row per (video_id, trending_region) within the window — same
+    # semantics as the previous pandas drop_duplicates(keep='last').
+    from pyspark.sql.window import Window
+    from pyspark.sql.functions import row_number, desc, sum as F_sum, avg as F_avg, countDistinct
+    window = Window.partitionBy("video_id", "trending_region").orderBy(desc("collected_at_ts"))
+    latest = sdf.withColumn("__rn", row_number().over(window)).filter(col("__rn") == 1)
+
+    row = (
+        latest.agg(
+            countDistinct("video_id").alias("unique_videos"),
+            F_sum("view_count").alias("total_views"),
+            F_avg("engagement_rate").alias("avg_engagement_rate"),
+            countDistinct("category_name").alias("tracked_categories"),
+        )
+        .collect()
+    )
+    if not row:
+        return {"unique_videos": 0, "total_views": 0, "avg_engagement_rate": 0.0, "tracked_categories": 0}
+    r = row[0].asDict()
+    # Replace None with safe defaults so the metric formatter never blows up.
+    return {
+        "unique_videos": int(r["unique_videos"] or 0),
+        "total_views": int(r["total_views"] or 0),
+        "avg_engagement_rate": float(r["avg_engagement_rate"] or 0.0),
+        "tracked_categories": int(r["tracked_categories"] or 0),
+    }
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_filter_source():
     if not gold_latest_snapshot_df.empty:
@@ -1058,6 +1243,9 @@ region_options = ["All"] + sorted(filter_source_df["trending_region"].dropna().a
 
 selected_category = st.sidebar.selectbox("Category", category_options)
 selected_region = st.sidebar.selectbox("Region", region_options)
+# Spark-side filter values: None means "no filter", anything else is a literal match.
+diagnostic_category = None if selected_category == "All" else selected_category
+diagnostic_region = None if selected_region == "All" else selected_region
 history_window = st.sidebar.selectbox(
     "Silver History Window",
     ["Last 24 Hours", "Last 7 Days", "Last 30 Days", "All Available"],
@@ -1085,55 +1273,34 @@ if df.empty:
 use_gold_category_summary = (
     not gold_category_summary_df.empty and selected_region == "All" and selected_category == "All"
 )
-summary_df = gold_category_summary_df if use_gold_category_summary else build_category_summary(df)
-top_videos_df = build_top_videos(df)
-diagnostic_df = build_diagnostic_table(df)
-forecast_df = build_forecast(df)
-recommendations_df = build_recommendations(df)
+# --- Spark-driven descriptive aggregations -------------------------------
+# All tab-1 (descriptive) tables are computed by reading the Silver Delta
+# layer directly with Spark and aggregating there. Pandas is used ONLY at
+# the very last step (via _safe_pandas_from_spark) because Streamlit /
+# Altair render via pandas/Arrow.
+summary_df = (
+    gold_category_summary_df
+    if use_gold_category_summary
+    else load_spark_category_summary(diagnostic_category, diagnostic_region, history_window)
+)
 
 use_gold_views_ts = (
     not gold_views_timeseries_df.empty and selected_region == "All" and selected_category == "All"
 )
-views_ts_df = gold_views_timeseries_df if use_gold_views_ts else build_views_timeseries(df)
-
-if not gold_region_timeseries_df.empty and selected_category == "All":
-    region_ts_df = gold_region_timeseries_df.copy()
-    if selected_region != "All":
-        region_ts_df = region_ts_df[region_ts_df["trending_region"] == selected_region]
-else:
-    region_ts_df = build_region_timeseries(df)
-
-publish_heatmap_df = build_publish_hour_heatmap(df)
-category_share_df = build_category_share_over_time(df)
-use_gold_channel_board = (
-    not gold_channel_leaderboard_df.empty and selected_region == "All" and selected_category == "All"
+views_ts_df = (
+    gold_views_timeseries_df
+    if use_gold_views_ts
+    else load_spark_views_timeseries(diagnostic_category, diagnostic_region, history_window)
 )
-channel_board_df = gold_channel_leaderboard_df if use_gold_channel_board else build_channel_leaderboard(df)
-bubble_df = build_bubble_dataset(df)
-outlier_df = build_outlier_videos(df)
-growth_df = build_category_growth(df)
-comments_vs_views_df = build_comments_vs_views(df)
 
-engagement_heatmap_df = build_engagement_heatmap(df)
-duration_dist_df = build_duration_distribution(df)
-subscriber_tier_df = build_subscriber_tier_distribution(df)
-tag_usage_df = build_tag_usage_frequency(df)
-hd_sd_df = build_hd_sd_distribution(df)
-caption_rate_df = build_caption_rate(df)
+duration_dist_df = load_spark_duration_distribution(diagnostic_category, diagnostic_region, history_window)
+subscriber_tier_df = load_spark_subscriber_tier_distribution(diagnostic_category, diagnostic_region, history_window)
+tag_usage_df = load_spark_tag_usage_frequency(diagnostic_category, diagnostic_region, history_window)
+trending_rank_dist_df = load_spark_trending_rank_distribution(diagnostic_category, diagnostic_region, history_window)
 
-velocity_df = build_view_velocity(df)
-persistence_df = build_trending_persistence(df)
-rank_movement_df = build_rank_movement(df)
-corr_df, corr_scatter_df = build_engagement_vs_views_correlation(df)
-title_char_df = build_title_characteristics(df)
-tag_count_df = build_tag_count_vs_engagement(df)
-duration_eng_df = build_duration_vs_engagement(df)
-channel_size_df = build_channel_size_vs_reach(df)
-regional_div_df = build_regional_preference_divergence(df)
-recency_bias_df = build_recency_bias(df)
-weekend_weekday_df = build_weekend_weekday_behavior(df)
-
-trending_rank_dist_df = build_trending_rank_distribution(df)
+# --- Predictive / prescriptive pipeline (still pandas-backed) ------------
+# These wrap sklearn / regression code that genuinely needs numpy/pandas
+# arrays, so the legacy pandas-based builders remain for tab 2 and tab 3.
 entry_probability_df = build_trending_entry_probability(df)
 video_forecast_df = build_view_count_forecast_v2(df)
 duration_prediction_df = build_trending_duration_prediction(df)
@@ -1147,28 +1314,16 @@ campaign_alerts_df = build_campaign_timing_alerts(df)
 regional_expansion_df = build_regional_expansion_recommendations(df)
 
 
-if not gold_latest_snapshot_df.empty:
-    latest_records = gold_latest_snapshot_df.copy()
-    if selected_category != "All":
-        latest_records = latest_records[latest_records["category_name"] == selected_category]
-    if selected_region != "All":
-        latest_records = latest_records[latest_records["trending_region"] == selected_region]
-else:
-    latest_records = df.sort_values("collected_at").drop_duplicates(subset=["video_id", "trending_region"], keep="last")
-
+# KPI metrics — computed entirely in Spark.
+kpis = load_spark_kpis(diagnostic_category, diagnostic_region, history_window)
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Unique Videos", f"{latest_records['video_id'].nunique():,}")
-k2.metric("Total Views", f"{int(latest_records['view_count'].sum()):,}")
+k1.metric("Unique Videos", f"{kpis['unique_videos']:,}")
+k2.metric("Total Views", f"{kpis['total_views']:,}")
+k3.metric("Avg Engagement Rate", f"{kpis['avg_engagement_rate'] * 100:.2f}%")
+k4.metric("Tracked Categories", f"{kpis['tracked_categories']:,}")
 
-avg_eng = pd.to_numeric(latest_records["engagement_rate"], errors="coerce")
-avg_eng = avg_eng.replace([float("inf"), -float("inf")], pd.NA).dropna()
-avg_eng_value = 0 if avg_eng.empty else avg_eng.mean()
-k3.metric("Avg Engagement Rate", f"{avg_eng_value * 100:.2f}%")
-
-k4.metric("Tracked Categories", f"{latest_records['category_name'].nunique():,}")
-
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Descriptive", "Diagnostic", "Predictive", "Prescriptive"]
+tab1, tab2, tab3 = st.tabs(
+    ["Descriptive", "Predictive", "Prescriptive"]
 )
 
 with tab1:
@@ -1460,32 +1615,6 @@ with tab1:
     #     )
     #     st.altair_chart(area_chart, width="stretch")
     
-    st.subheader("Engagement Rate Heatmap (Category x Region)")
-    st.markdown("Analytical question: Which category-region combinations show the strongest engagement?")
-
-    if engagement_heatmap_df.empty:
-        st.info("No engagement heatmap data available.")
-    else:
-        er_heatmap = (
-            alt.Chart(engagement_heatmap_df)
-            .mark_rect()
-            .encode(
-                x=alt.X("trending_region:N", title="Region"),
-                y=alt.Y("category_name:N", title="Category"),
-                color=alt.Color("avg_engagement_rate:Q", title="Avg Engagement Rate"),
-                tooltip=[
-                    "trending_region",
-                    "category_name",
-                    alt.Tooltip("avg_engagement_rate:Q", format=".2%"),
-                    alt.Tooltip("avg_like_rate:Q", format=".2%"),
-                    alt.Tooltip("avg_comment_rate:Q", format=".2%"),
-                    "sample_size",
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(er_heatmap, width="stretch")
-
     st.subheader("Video Duration Distribution")
     st.markdown("Analytical question: Which duration buckets are most common and which perform better?")
 
@@ -2230,58 +2359,6 @@ with tab1:
                 _explanation(_explain_tag_region_concentration(tag_region_df))
 
 
-    st.subheader("HD vs SD Distribution")
-    st.markdown("Analytical question: What quality standard dominates trending content?")
-
-    if hd_sd_df.empty:
-        st.info("No HD/SD distribution data available.")
-    else:
-        hd_sd_chart = (
-            alt.Chart(hd_sd_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("trending_region:N", title="Region"),
-                y=alt.Y("video_count:Q", stack="normalize", title="Share of Videos"),
-                color=alt.Color("definition:N", title="Definition"),
-                tooltip=[
-                    "trending_region",
-                    "category_name",
-                    "definition",
-                    "video_count",
-                    alt.Tooltip("pct:Q", format=".1f"),
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(hd_sd_chart, width="stretch")
-
-    
-    st.subheader("Caption / Subtitle Availability Rate")
-    st.markdown("Analytical question: Which categories and regions have better accessibility coverage?")
-
-    if caption_rate_df.empty:
-        st.info("No caption rate data available.")
-    else:
-        caption_chart = (
-            alt.Chart(caption_rate_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("caption_rate_pct:Q", title="Caption Rate (%)"),
-                y=alt.Y("category_name:N", sort="-x", title="Category"),
-                color=alt.Color("trending_region:N", title="Region"),
-                tooltip=[
-                    "trending_region",
-                    "category_name",
-                    "captioned_videos",
-                    "total_unique_videos",
-                    alt.Tooltip("caption_rate_pct:Q", format=".1f"),
-                ],
-            )
-            .properties(height=450)
-        )
-        st.altair_chart(caption_chart, width="stretch")
-
-
     st.subheader("Trending Rank Distribution by Category")
     st.markdown("Mode 1: Latest snapshot only. Out of the current trending slots, how many belong to each category?")
 
@@ -2498,357 +2575,10 @@ with tab1:
                     _explanation(_explain_share_drivers(share_drivers_df))
 
 
-    st.subheader("Top Channels Leaderboard")
-    st.markdown("Analytical question: Which channels are consistently generating reach and engagement?")
-
-    if channel_board_df.empty:
-        st.info("Channel leaderboard needs channel-level data.")
-    else:
-        channel_chart = (
-            alt.Chart(channel_board_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("total_views:Q", title="Total Views"),
-                y=alt.Y("channel_title:N", sort="-x", title="Channel"),
-                color=alt.Color("avg_engagement_rate:Q", title="Avg Engagement Rate"),
-                tooltip=[
-                    "channel_title",
-                    "videos",
-                    "total_views",
-                    "total_engagements",
-                    alt.Tooltip("avg_engagement_rate:Q", format=".2%"),
-                    "avg_subscribers",
-                ],
-            )
-            .properties(height=450)
-        )
-        st.altair_chart(channel_chart, width="stretch")
-
-    st.subheader("Top Trending Videos Leaderboard")
-    st.markdown("Analytical question: Which videos are leading the current trending batch right now?")
-
-    if top_videos_df.empty:
-        st.info("No latest-batch leaderboard data available.")
-    else:
-        st.dataframe(
-            top_videos_df.rename(
-                columns={
-                    "category_name": "Category",
-                    "trending_region": "Region",
-                    "trending_rank": "YouTube Rank",
-                    "computed_rank": "Views Rank",
-                    "view_count": "Views",
-                    "like_count": "Likes",
-                    "comment_count": "Comments",
-                    "like_rate": "Like Rate",
-                    "comment_rate": "Comment Rate",
-                    "channel_title": "Channel",
-                    "video_id": "Video ID",
-                    "title": "Title",
-                }
-            ),
-            width="stretch",
-        )
 
 
 with tab2:
-    st.subheader("2. Why is it happening?")
-    st.markdown("Diagnostic analytics explains the drivers behind trending behavior, content momentum, audience response, and market differences.")
-
-    st.subheader("View Velocity")
-    st.markdown("Mode 1: Latest snapshot. Which videos are gaining views fastest relative to age?")
-    if velocity_df.empty:
-        st.info("No velocity data available.")
-    else:
-        velocity_chart = (
-            alt.Chart(velocity_df.head(30))
-            .mark_bar()
-            .encode(
-                x=alt.X("views_per_hour:Q", title="Views per Hour"),
-                y=alt.Y("title:N", sort="-x", title="Video"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "title",
-                    "category_name",
-                    "trending_region",
-                    "view_count",
-                    "video_age_hours",
-                    "views_per_hour",
-                    "category_avg_velocity",
-                    "relative_velocity",
-                    "trending_rank",
-                ],
-            )
-            .properties(height=500)
-        )
-        st.altair_chart(velocity_chart, width="stretch")
-
-    st.subheader("Trending Persistence Tracking")
-    st.markdown("Mode 3: Full time-series. Which videos stay in trending for the longest duration?")
-    if persistence_df.empty:
-        st.info("No persistence data available.")
-    else:
-        persistence_chart = (
-            alt.Chart(persistence_df.head(30))
-            .mark_bar()
-            .encode(
-                x=alt.X("batches_appeared:Q", title="Batches Appeared"),
-                y=alt.Y("title:N", sort="-x", title="Video"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "title",
-                    "channel_title",
-                    "category_name",
-                    "trending_region",
-                    "batches_appeared",
-                    "estimated_hours_trending",
-                    "best_rank_achieved",
-                    "peak_view_count",
-                ],
-            )
-            .properties(height=500)
-        )
-        st.altair_chart(persistence_chart, width="stretch")
-
-    st.subheader("Rank Movement Analysis")
-    st.markdown("Mode 3: Full time-series. How is trending rank changing over consecutive batches?")
-    if rank_movement_df.empty:
-        st.info("No rank movement data available.")
-    else:
-        rank_chart = (
-            alt.Chart(rank_movement_df.head(500))
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("collected_at:T", title="Collected Time"),
-                y=alt.Y("trending_rank:Q", title="Trending Rank", sort="descending"),
-                color=alt.Color("title:N", title="Video"),
-                tooltip=[
-                    "title",
-                    "category_name",
-                    "trending_region",
-                    "collected_at",
-                    "trending_rank",
-                    "prev_rank",
-                    "rank_improvement",
-                    "views_gained_this_batch",
-                ],
-            )
-            .properties(height=450)
-        )
-        st.altair_chart(rank_chart, width="stretch")
-
-    st.subheader("Engagement vs View Count Correlation")
-    st.markdown("Latest snapshot scatter plus category-region correlation scores.")
-    if corr_scatter_df.empty:
-        st.info("No correlation data available.")
-    else:
-        corr_chart = (
-            alt.Chart(corr_scatter_df)
-            .mark_circle(opacity=0.7)
-            .encode(
-                x=alt.X("view_count:Q", title="View Count"),
-                y=alt.Y("engagement_rate:Q", title="Engagement Rate"),
-                color=alt.Color("category_name:N", title="Category"),
-                size=alt.Size("channel_subscriber_count:Q", title="Subscriber Count"),
-                tooltip=[
-                    "title",
-                    "category_name",
-                    "trending_region",
-                    "view_count",
-                    "engagement_rate",
-                    "channel_subscriber_count",
-                ],
-            )
-            .properties(height=450)
-        )
-        st.altair_chart(corr_chart, width="stretch")
-
-        if not corr_df.empty:
-            st.dataframe(corr_df, width="stretch")
-
-    st.subheader("Title Characteristics vs Performance")
-    st.markdown("Mode 2: Deduplicated historical. Which title patterns are associated with stronger performance?")
-    if title_char_df.empty:
-        st.info("No title-characteristics data available.")
-    else:
-        title_chart = (
-            alt.Chart(title_char_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("avg_er:Q", title="Average Engagement Rate"),
-                y=alt.Y("title_length:N", title="Title Length"),
-                color=alt.Color("caps_level:N", title="Caps Level"),
-                column=alt.Column("title_has_question:N", title="Has Question"),
-                tooltip=[
-                    "category_name",
-                    "trending_region",
-                    "title_has_question",
-                    "title_has_number",
-                    "caps_level",
-                    "title_length",
-                    "avg_velocity",
-                    "avg_er",
-                    "sample_size",
-                ],
-            )
-            .properties(height=350)
-        )
-        st.altair_chart(title_chart, width="stretch")
-
-    st.subheader("Tag Count vs Engagement")
-    st.markdown("Mode 2: Deduplicated historical. Does having more tags relate to stronger engagement?")
-    if tag_count_df.empty:
-        st.info("No tag-count data available.")
-    else:
-        tag_chart = (
-            alt.Chart(tag_count_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("tag_count_bucket:N", title="Tag Count Bucket"),
-                y=alt.Y("avg_er:Q", title="Average Engagement Rate"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "category_name",
-                    "tag_count_bucket",
-                    "avg_er",
-                    "avg_views",
-                    "n_videos",
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(tag_chart, width="stretch")
-
-    st.subheader("Duration vs Engagement Relationship")
-    st.markdown("Mode 2: Deduplicated historical. Which duration buckets perform best?")
-    if duration_eng_df.empty:
-        st.info("No duration-engagement data available.")
-    else:
-        duration_chart = (
-            alt.Chart(duration_eng_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("duration_bucket:N", title="Duration Bucket"),
-                y=alt.Y("avg_er:Q", title="Average Engagement Rate"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "category_name",
-                    "trending_region",
-                    "duration_bucket",
-                    "avg_like_rate",
-                    "avg_comment_rate",
-                    "avg_er",
-                    "avg_views",
-                    "median_views",
-                    "n_videos",
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(duration_chart, width="stretch")
-
-    st.subheader("Channel Size vs Trending Reach")
-    st.markdown("Mode 2: Deduplicated historical. How does creator size relate to trending reach?")
-    if channel_size_df.empty:
-        st.info("No channel-size data available.")
-    else:
-        channel_size_chart = (
-            alt.Chart(channel_size_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("subscriber_tier:N", title="Subscriber Tier"),
-                y=alt.Y("avg_views:Q", title="Average Views"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "trending_region",
-                    "category_name",
-                    "subscriber_tier",
-                    "avg_trending_rank",
-                    "best_rank_achieved",
-                    "avg_views",
-                    "unique_videos",
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(channel_size_chart, width="stretch")
-
-    st.subheader("Regional Content Preference Divergence")
-    st.markdown("Latest snapshot. Which regions over-index or under-index on certain categories versus the global mix?")
-    if regional_div_df.empty:
-        st.info("No regional divergence data available.")
-    else:
-        divergence_chart = (
-            alt.Chart(regional_div_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("divergence_score:Q", title="Divergence Score"),
-                y=alt.Y("category_name:N", title="Category"),
-                color=alt.Color("trending_region:N", title="Region"),
-                tooltip=[
-                    "trending_region",
-                    "category_name",
-                    "regional_pct",
-                    "global_pct",
-                    "divergence_score",
-                ],
-            )
-            .properties(height=450)
-        )
-        st.altair_chart(divergence_chart, width="stretch")
-
-    st.subheader("Recency Bias Detection")
-    st.markdown("Mode 2: Deduplicated historical. How old are videos when they first enter trending?")
-    if recency_bias_df.empty:
-        st.info("No recency-bias data available.")
-    else:
-        recency_chart = (
-            alt.Chart(recency_bias_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("age_at_trending_entry:N", title="Age at Trending Entry"),
-                y=alt.Y("video_count:Q", title="Video Count"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "category_name",
-                    "trending_region",
-                    "age_at_trending_entry",
-                    "video_count",
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(recency_chart, width="stretch")
-
-    st.subheader("Weekend vs Weekday Trending Behavior")
-    st.markdown("Mode 3: Full time-series. Are engagement and views different on weekends vs weekdays?")
-    if weekend_weekday_df.empty:
-        st.info("No weekend-weekday data available.")
-    else:
-        weekend_chart = (
-            alt.Chart(weekend_weekday_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("day_type:N", title="Day Type"),
-                y=alt.Y("avg_er:Q", title="Average Engagement Rate"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "category_name",
-                    "trending_region",
-                    "day_type",
-                    "avg_view_count",
-                    "avg_er",
-                    "unique_videos_seen",
-                    "total_observations",
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(weekend_chart, width="stretch")
-
-
-with tab3:
-    st.subheader("3. What will happen?")
+    st.subheader("2. What will happen?")
     st.markdown("Predictive analytics estimates which videos are most likely to keep trending, how their views may evolve, how long they may remain visible, and how category share may shift next.")
 
     st.subheader("Trending Entry Probability Model")
@@ -2879,6 +2609,10 @@ with tab3:
             .properties(height=500)
         )
         st.altair_chart(entry_chart, width="stretch")
+        _model_metrics_strip(
+            "Trending Entry Probability",
+            load_entry_probability_metrics(df),
+        )
 
     st.subheader("View Count Forecasting")
     st.markdown("Mode 3 per-video forecasting. The graph projects future view counts for currently trending videos with a simple confidence band.")
@@ -2933,6 +2667,10 @@ with tab3:
             )
         )
         st.altair_chart((confidence_band + actual_line + forecast_line).properties(height=450), width="stretch")
+        _model_metrics_strip(
+            "View Count Forecast",
+            load_view_forecast_metrics(df),
+        )
 
     st.subheader("Trending Duration Prediction")
     st.markdown("Historical episodes are used to estimate total trending lifespan and remaining time for the videos in the current batch.")
@@ -2961,6 +2699,10 @@ with tab3:
             .properties(height=500)
         )
         st.altair_chart(duration_prediction_chart, width="stretch")
+        _model_metrics_strip(
+            "Trending Duration Prediction",
+            load_duration_prediction_metrics(df),
+        )
 
     st.subheader("Peak Rank and Category Forecasting")
     st.markdown("These charts estimate the best future rank a current video may reach and the next category-share trajectory using the accumulated time-series history.")
@@ -2989,6 +2731,10 @@ with tab3:
             .properties(height=450)
         )
         st.altair_chart(peak_rank_chart, width="stretch")
+        _model_metrics_strip(
+            "Peak Rank Forecast",
+            load_peak_rank_metrics(df),
+        )
 
     if category_share_forecast_df.empty:
         st.info("Category-share forecasting needs at least 2 time buckets per category.")
@@ -3011,9 +2757,13 @@ with tab3:
             .properties(height=400)
         )
         st.altair_chart(category_share_chart, width="stretch")
+        _model_metrics_strip(
+            "Category Share Forecast",
+            load_category_share_metrics(df),
+        )
 
-with tab4:
-    st.subheader("4. What should be done?")
+with tab3:
+    st.subheader("3. What should be done?")
     st.markdown("Prescriptive analytics converts the historical and current signals into recommended actions: when to post, where gaps exist, who to partner with, what content format to favor, when to intervene, and which regions to expand into.")
 
     st.subheader("Optimal Posting Window")
