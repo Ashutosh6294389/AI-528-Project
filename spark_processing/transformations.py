@@ -6,6 +6,8 @@ from pyspark.sql.functions import (
     count,
     countDistinct,
     current_timestamp,
+    desc,
+    explode,
     expr,
     length,
     lit,
@@ -126,13 +128,20 @@ def build_gold_latest_snapshot(silver_df: DataFrame) -> DataFrame:
 
 
 def build_gold_category_summary(latest_snapshot_df: DataFrame) -> DataFrame:
+    """Aggregated at (category_name, trending_region) grain so the
+    dashboard can filter by either / both without falling back to Silver.
+    Stores sums + sample_size alongside averages so the dashboard can
+    weight-average across regions when no region filter is selected."""
     return (
-        latest_snapshot_df.groupBy("category_name")
+        latest_snapshot_df.groupBy("category_name", "trending_region")
         .agg(
             countDistinct("video_id").alias("videos"),
             spark_sum("view_count").alias("total_views"),
             spark_sum("like_count").alias("total_likes"),
             spark_sum("comment_count").alias("total_comments"),
+            spark_sum("engagement_rate").alias("sum_engagement_rate"),
+            spark_sum("like_rate").alias("sum_like_rate"),
+            count(lit(1)).alias("sample_size"),
             avg("engagement_rate").alias("avg_engagement_rate"),
             avg("like_rate").alias("avg_like_rate"),
         )
@@ -140,8 +149,10 @@ def build_gold_category_summary(latest_snapshot_df: DataFrame) -> DataFrame:
 
 
 def build_gold_views_timeseries(silver_df: DataFrame) -> DataFrame:
+    """Aggregated at (category_name, trending_region, time_bucket) — adds
+    region so the dashboard can filter directly without re-scanning Silver."""
     return (
-        silver_df.groupBy("category_name", "time_bucket")
+        silver_df.groupBy("category_name", "trending_region", "time_bucket")
         .agg(
             spark_sum("view_count").alias("total_views"),
             spark_sum("engagements").alias("total_engagements"),
@@ -172,6 +183,86 @@ def build_gold_channel_leaderboard(latest_snapshot_df: DataFrame) -> DataFrame:
     )
 
 
+def build_gold_duration_distribution(silver_df: DataFrame) -> DataFrame:
+    """Aggregated at (trending_region, category_name, duration_bucket).
+    Dashboard reads this small table whole and lets Altair filter/colour
+    by category. Stores sum + count so any cross-category rollup can
+    recompute averages correctly."""
+    return (
+        silver_df.filter(col("duration_bucket").isNotNull())
+        .groupBy("trending_region", "category_name", "duration_bucket")
+        .agg(
+            countDistinct("video_id").alias("video_count"),
+            avg("view_count").alias("avg_views_in_bucket"),
+            avg("engagement_rate").alias("avg_er_in_bucket"),
+            spark_sum("view_count").alias("sum_views_in_bucket"),
+            spark_sum("engagements").alias("sum_engagements_in_bucket"),
+        )
+    )
+
+
+def build_gold_subscriber_tier_distribution(silver_df: DataFrame) -> DataFrame:
+    """Aggregated at (trending_region, category_name, subscriber_tier).
+    Dashboard recomputes the within-region share at render time so any
+    filter combination still works."""
+    tiered = silver_df.withColumn(
+        "subscriber_tier",
+        when(col("channel_subscriber_count") < 100_000, lit("Small (<100K)"))
+        .when(col("channel_subscriber_count") < 1_000_000, lit("Mid (100K-1M)"))
+        .when(col("channel_subscriber_count") < 10_000_000, lit("Large (1M-10M)"))
+        .otherwise(lit("Mega (10M+)")),
+    )
+    per_video = tiered.dropDuplicates(
+        ["video_id", "trending_region", "category_name", "subscriber_tier"]
+    )
+    return (
+        per_video.groupBy("trending_region", "category_name", "subscriber_tier")
+        .agg(countDistinct("video_id").alias("video_count"))
+    )
+
+
+def build_gold_tag_usage_frequency(silver_df: DataFrame) -> DataFrame:
+    """Aggregated at (tag, trending_region, category_name). Dashboard
+    filters and re-ranks at render time."""
+    exploded = (
+        silver_df.withColumn("tag", explode("tags_array"))
+        .filter(col("tag").isNotNull() & (trim(col("tag")) != ""))
+    )
+    return (
+        exploded.groupBy("tag", "trending_region", "category_name")
+        .agg(countDistinct("video_id").alias("videos_using_tag"))
+    )
+
+
+def build_gold_trending_rank_distribution(silver_df: DataFrame) -> DataFrame:
+    """Latest-snapshot category share at (trending_region, category_name).
+    Distinct videos currently trending in each region/category, plus the
+    region total so the dashboard can divide for `pct_of_trending`."""
+    silver = silver_df.filter(col("trending_rank").isNotNull())
+    window = Window.partitionBy("video_id", "trending_region").orderBy(desc("collected_at_ts"))
+    latest = (
+        silver.withColumn("__rn", row_number().over(window))
+        .where(col("__rn") == 1)
+        .drop("__rn")
+    )
+
+    region_counts = (
+        latest.groupBy("trending_region", "category_name")
+        .agg(countDistinct("video_id").alias("video_count"))
+    )
+    region_totals = (
+        latest.groupBy("trending_region")
+        .agg(countDistinct("video_id").alias("region_total"))
+    )
+    return (
+        region_counts.join(region_totals, on="trending_region", how="inner")
+        .withColumn(
+            "pct_of_trending",
+            col("video_count") / col("region_total") * lit(100.0),
+        )
+    )
+
+
 def refresh_gold_tables(spark: SparkSession, silver_path: str, gold_paths: dict[str, str]) -> None:
     silver_df = spark.read.format("delta").load(silver_path)
     latest_snapshot_df = build_gold_latest_snapshot(silver_df)
@@ -181,6 +272,10 @@ def refresh_gold_tables(spark: SparkSession, silver_path: str, gold_paths: dict[
     build_gold_views_timeseries(silver_df).write.format("delta").mode("overwrite").save(gold_paths["views_timeseries"])
     build_gold_region_timeseries(silver_df).write.format("delta").mode("overwrite").save(gold_paths["region_timeseries"])
     build_gold_channel_leaderboard(latest_snapshot_df).write.format("delta").mode("overwrite").save(gold_paths["channel_leaderboard"])
+    build_gold_duration_distribution(silver_df).write.format("delta").mode("overwrite").save(gold_paths["duration_distribution"])
+    build_gold_subscriber_tier_distribution(silver_df).write.format("delta").mode("overwrite").save(gold_paths["subscriber_tier_distribution"])
+    build_gold_tag_usage_frequency(silver_df).write.format("delta").mode("overwrite").save(gold_paths["tag_usage_frequency"])
+    build_gold_trending_rank_distribution(silver_df).write.format("delta").mode("overwrite").save(gold_paths["trending_rank_distribution"])
 
 
 def duration_to_seconds_expr(column_name: str):

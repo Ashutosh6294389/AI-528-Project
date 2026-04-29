@@ -21,6 +21,10 @@ def get_medallion_paths() -> dict:
             "views_timeseries": str(gold_root / "views_timeseries"),
             "region_timeseries": str(gold_root / "region_timeseries"),
             "channel_leaderboard": str(gold_root / "channel_leaderboard"),
+            "duration_distribution": str(gold_root / "duration_distribution"),
+            "subscriber_tier_distribution": str(gold_root / "subscriber_tier_distribution"),
+            "tag_usage_frequency": str(gold_root / "tag_usage_frequency"),
+            "trending_rank_distribution": str(gold_root / "trending_rank_distribution"),
         },
         "checkpoint": str(CHECKPOINT_ROOT),
     }

@@ -22,23 +22,15 @@ from analytics.business_analysis import (
     # The following builders are only used by tab 2 (Predictive) and tab 3
     # (Prescriptive). They wrap sklearn / regression code that operates on
     # numpy/pandas arrays, so they remain pandas-backed.
-    build_trending_entry_probability,
     build_view_count_forecast_v2,
     build_trending_duration_prediction,
     build_peak_rank_forecast,
     build_category_share_forecast,
-    build_optimal_posting_window,
-    build_trending_gap_opportunity,
-    build_creator_partnership_recommendations,
-    build_format_prescriptions,
-    build_campaign_timing_alerts,
-    build_regional_expansion_recommendations,
 )
 from analytics.predictive_metrics import (
     evaluate_category_share_forecast,
     evaluate_peak_rank_forecast,
     evaluate_trending_duration_prediction,
-    evaluate_trending_entry_probability,
     evaluate_view_count_forecast,
 )
 from analytics.spark_descriptive import (
@@ -50,26 +42,17 @@ from analytics.spark_descriptive import (
     build_spark_views_timeseries,
 )
 from analytics.spark_diagnostics import (
-    build_channel_mix_shift_diagnostic,
-    build_duration_category_overindex_diagnostic,
-    build_duration_engagement_diagnostic,
-    build_duration_region_diagnostic,
-    build_duration_velocity_diagnostic,
-    build_engagement_shift_diagnostic,
-    build_category_share_drivers_diagnostic,
-    build_high_engagement_tags_diagnostic,
-    build_persistence_distribution_diagnostic,
-    build_rank_new_vs_persisting_diagnostic,
-    build_subscriber_engagement_diagnostic,
-    build_subscriber_persistence_diagnostic,
-    build_subscriber_region_diagnostic,
-    build_subscriber_views_diagnostic,
-    build_tag_density_performance_diagnostic,
-    build_tag_effectiveness_diagnostic,
-    build_tag_region_concentration_diagnostic,
-    build_top_rank_channel_concentration_diagnostic,
-    build_velocity_shift_diagnostic,
-    build_velocity_vs_rank_diagnostic,
+    # v2 mechanical-decomposition diagnostics (one pair per descriptive chart)
+    build_views_volume_strength_diagnostic,
+    build_views_new_vs_carryover_diagnostic,
+    build_duration_slot_footprint_diagnostic,
+    build_duration_audience_response_diagnostic,
+    build_tier_effort_reward_diagnostic,
+    build_tier_persistence_engagement_diagnostic,
+    build_tag_adoption_intensity_diagnostic,
+    build_tag_cooccurrence_diagnostic,
+    build_rank_slot_turnover_diagnostic,
+    build_rank_channel_concentration_v2_diagnostic,
 )
 
 MEDALLION_PATHS = get_medallion_paths()
@@ -79,6 +62,10 @@ GOLD_CATEGORY_SUMMARY_PATH = MEDALLION_PATHS["gold"]["category_summary"]
 GOLD_VIEWS_TIMESERIES_PATH = MEDALLION_PATHS["gold"]["views_timeseries"]
 GOLD_REGION_TIMESERIES_PATH = MEDALLION_PATHS["gold"]["region_timeseries"]
 GOLD_CHANNEL_LEADERBOARD_PATH = MEDALLION_PATHS["gold"]["channel_leaderboard"]
+GOLD_DURATION_DISTRIBUTION_PATH = MEDALLION_PATHS["gold"]["duration_distribution"]
+GOLD_SUBSCRIBER_TIER_PATH = MEDALLION_PATHS["gold"]["subscriber_tier_distribution"]
+GOLD_TAG_USAGE_PATH = MEDALLION_PATHS["gold"]["tag_usage_frequency"]
+GOLD_TRENDING_RANK_DIST_PATH = MEDALLION_PATHS["gold"]["trending_rank_distribution"]
 MAX_DASHBOARD_ROWS = 50000
 DEFAULT_HISTORY_WINDOW_INDEX = 1
 
@@ -202,6 +189,115 @@ def _explanation(text: str) -> None:
     )
 
 
+def _render_suggestion_box(title: str, bullets: list[str]) -> None:
+    body = "".join(f"<li>{bullet}</li>" for bullet in bullets)
+    st.markdown(
+        f"<div style='font-size:0.88rem; color:#0f172a; "
+        f"background:#eff6ff; padding:0.65rem 0.85rem; "
+        f"border-left:3px solid #2563eb; border-radius:4px; "
+        f"margin-top:-0.2rem; margin-bottom:0.9rem;'>"
+        f"<b>{title}</b><ul style='margin:0.35rem 0 0 1rem; padding:0;'>{body}</ul></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _suggest_from_view_forecast(selected_rows: pd.DataFrame) -> list[str]:
+    if selected_rows.empty:
+        return []
+    actual = selected_rows[selected_rows["series"] == "Actual"].sort_values("time_bucket")
+    forecast = selected_rows[selected_rows["series"] == "Forecast"].sort_values("time_bucket")
+    if actual.empty or forecast.empty:
+        return []
+
+    current_views = float(actual["forecast_views"].iloc[-1])
+    next_forecast = float(forecast["forecast_views"].iloc[0])
+    upper = float(forecast["upper_bound"].iloc[0])
+    lower = float(forecast["lower_bound"].iloc[0])
+    growth_pct = 0.0 if current_views == 0 else ((next_forecast - current_views) / current_views) * 100.0
+    spread_pct = 0.0 if next_forecast == 0 else ((upper - lower) / max(next_forecast, 1.0)) * 100.0
+
+    bullets = []
+    if growth_pct >= 10:
+        bullets.append(f"Momentum is still strong: projected views are up about {growth_pct:.1f}% next step, so this is a good candidate to keep amplifying.")
+    elif growth_pct <= -10:
+        bullets.append(f"Projected views are softening by about {abs(growth_pct):.1f}%, so avoid overcommitting budget and watch for decay.")
+    else:
+        bullets.append("Projected view growth is fairly flat, so treat this as a maintain-and-monitor title rather than a breakout.")
+
+    if spread_pct >= 35:
+        bullets.append("The forecast band is wide, which means uncertainty is high; use lighter-touch actions and recheck after the next batch.")
+    else:
+        bullets.append("The forecast band is reasonably tight, so you can treat the short-horizon projection as directionally dependable.")
+
+    bullets.append("Use the next observed batch as the decision checkpoint: continue boosting only if actual views track near or above the forecast line.")
+    return bullets
+
+
+def _suggest_from_duration_prediction(row: pd.Series) -> list[str]:
+    remaining = float(row.get("predicted_remaining_hours", 0) or 0)
+    current_rank = float(row.get("current_rank", 0) or 0)
+    bullets = []
+    if remaining >= 6:
+        bullets.append(f"This video still has roughly {remaining:.1f} hours of modeled runway, so it is worth supporting with sustained promotion.")
+    elif remaining >= 2:
+        bullets.append(f"There is still about {remaining:.1f} hours of expected trending life left, so treat it as a near-term opportunity window.")
+    else:
+        bullets.append(f"Modeled remaining life is short at about {remaining:.1f} hours, so any intervention should be immediate or not at all.")
+
+    if current_rank <= 10:
+        bullets.append("It is already sitting near the top of trending, so the main action is defense: keep momentum from slipping.")
+    else:
+        bullets.append("It still has room to climb from its current rank, so concentrate support now rather than late in the cycle.")
+
+    bullets.append("Prioritize this title relative to others only while its remaining-life estimate stays above your operational threshold.")
+    return bullets
+
+
+def _suggest_from_peak_rank_forecast(row: pd.Series) -> list[str]:
+    expected_gain = float(row.get("expected_rank_gain", 0) or 0)
+    predicted_peak = float(row.get("predicted_peak_rank", 0) or 0)
+    velocity = float(row.get("current_velocity", 0) or 0)
+    bullets = []
+    if expected_gain >= 10:
+        bullets.append(f"The model sees major upside with about {expected_gain:.1f} ranks of headroom, so this is a strong push candidate.")
+    elif expected_gain >= 3:
+        bullets.append(f"There is moderate upside of about {expected_gain:.1f} ranks, so a selective boost makes sense if inventory is limited.")
+    else:
+        bullets.append("Expected rank improvement is limited, so treat this as steady-state content rather than a breakout bet.")
+
+    bullets.append(f"Best-case modeled peak is around rank {predicted_peak:.1f}; use that as the ceiling when setting expectations.")
+
+    if velocity > 0:
+        bullets.append("Current velocity is positive, so the right action is to reinforce what is already working instead of changing packaging mid-flight.")
+    else:
+        bullets.append("Velocity is not especially strong, so don’t assume rank headroom will realize without extra support.")
+    return bullets
+
+
+def _suggest_from_category_share_forecast(selected_rows: pd.DataFrame) -> list[str]:
+    if selected_rows.empty:
+        return []
+    actual = selected_rows[selected_rows["series"] == "Actual"].sort_values("time_bucket")
+    forecast = selected_rows[selected_rows["series"] == "Forecast"].sort_values("time_bucket")
+    if actual.empty or forecast.empty:
+        return []
+
+    latest_actual = float(actual["forecast_share"].iloc[-1])
+    final_forecast = float(forecast["forecast_share"].iloc[-1])
+    delta_pp = (final_forecast - latest_actual) * 100.0
+    bullets = []
+    if delta_pp >= 1.0:
+        bullets.append(f"Share is projected to expand by about {delta_pp:.2f} percentage points, so this category deserves more inventory and attention.")
+    elif delta_pp <= -1.0:
+        bullets.append(f"Share is projected to contract by about {abs(delta_pp):.2f} points, so avoid over-weighting this category in the next cycle.")
+    else:
+        bullets.append("Projected share is fairly stable, so category investment can stay close to current levels.")
+
+    bullets.append("Use this share forecast as an allocation signal across categories rather than as a title-level action.")
+    bullets.append("Revisit the category mix after each new bucket, because share forecasts can move quickly when a few large videos enter or exit.")
+    return bullets
+
+
 def _model_metrics_strip(label: str, metrics: dict) -> None:
     """Render a small accuracy strip under a predictive chart.
 
@@ -271,11 +367,6 @@ def _model_metrics_strip(label: str, metrics: dict) -> None:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def load_entry_probability_metrics(_df: pd.DataFrame) -> dict:
-    return evaluate_trending_entry_probability(_df)
-
-
-@st.cache_data(ttl=120, show_spinner=False)
 def load_view_forecast_metrics(_df: pd.DataFrame) -> dict:
     return evaluate_view_count_forecast(_df)
 
@@ -295,432 +386,274 @@ def load_category_share_metrics(_df: pd.DataFrame) -> dict:
     return evaluate_category_share_forecast(_df)
 
 
-def _explain_velocity_shift(df) -> str:
-    if df.empty or "avg_velocity" not in df.columns:
+# --- v2 conclusion explainers (one per new diagnostic) -------------------
+# Each takes the small aggregated DataFrame returned by the matching loader
+# and produces a sentence describing what the chart is saying about the
+# trend. The wording flips with the data shape (volume-led vs strength-led,
+# concentrated vs broad, etc.).
+
+
+def _explain_views_volume_strength(df) -> str:
+    if df.empty or "unique_videos" not in df.columns:
         return "Not enough data to interpret the trend."
-    series = df.sort_values("time_bucket")["avg_velocity"].tolist()
-    direction = _explain_trend_direction(series)
-    delta = _pct_delta(series[0] if series else None, series[-1] if series else None)
-    if direction == "rising":
-        return f"Velocity is **rising** ({delta} from start to end), so videos in this category are gaining views faster over time — the category is heating up."
-    if direction == "falling":
-        return f"Velocity is **falling** ({delta}), so videos are accumulating views more slowly — momentum is cooling off."
-    if direction == "volatile":
-        return "Velocity is **swinging** sharply between buckets — the category has bursty traction rather than a steady trend."
-    return f"Velocity is **stable** ({delta}) — the category's traction is holding steady, neither accelerating nor decelerating."
+    df = df.sort_values("time_bucket")
+    vids_dir = _explain_trend_direction(df["unique_videos"].tolist())
+    avg_dir = _explain_trend_direction(df["avg_views_per_video"].tolist())
+    vids_delta = _pct_delta(df["unique_videos"].iloc[0], df["unique_videos"].iloc[-1])
+    avg_delta = _pct_delta(df["avg_views_per_video"].iloc[0], df["avg_views_per_video"].iloc[-1])
+    head = f"Unique videos {vids_dir} ({vids_delta}); avg views/video {avg_dir} ({avg_delta})."
+    if vids_dir == "rising" and avg_dir == "rising":
+        return f"{head} **Genuine heat** — both more videos AND each video pulling more views."
+    if vids_dir == "rising" and avg_dir != "rising":
+        return f"{head} **Volume-led** — the rise comes from a flood of new videos, not stronger individual performance."
+    if vids_dir != "rising" and avg_dir == "rising":
+        return f"{head} **Strength-led** — same number of videos, but each one is pulling more views (a few hits compounding)."
+    if vids_dir == "falling" and avg_dir == "falling":
+        return f"{head} **Cooling on both fronts** — fewer videos and weaker individual reach."
+    return f"{head} No single lever is dominating right now."
 
 
-def _explain_persistence_distribution(df) -> str:
-    if df.empty or "video_count" not in df.columns:
-        return "Not enough data to interpret persistence."
-    total = df["video_count"].sum()
-    if total == 0:
-        return "No videos in scope."
-    one_shot = df.loc[df["persistence_bucket"] == "1 batch", "video_count"].sum()
-    long_lived = df.loc[df["persistence_bucket"] == "7+ batches", "video_count"].sum()
-    one_shot_pct = one_shot / total
-    long_lived_pct = long_lived / total
-    if one_shot_pct > 0.5:
-        return (
-            f"**{_fmt_pct(one_shot_pct)}** of videos appear in trending only once — "
-            "this category is mostly **one-shot wonders**, with little staying power."
-        )
-    if long_lived_pct > 0.25:
-        return (
-            f"**{_fmt_pct(long_lived_pct)}** of videos persist 7+ batches — "
-            "this category has a **long-lived** trending core that holds attention."
-        )
-    return (
-        f"Persistence is **mixed**: {_fmt_pct(one_shot_pct)} one-shot, "
-        f"{_fmt_pct(long_lived_pct)} long-lived — the category has both transient and durable hits."
-    )
-
-
-def _explain_engagement_shift(df) -> str:
-    if df.empty or "avg_engagement_rate" not in df.columns:
-        return "Not enough data to interpret engagement."
-    overall = (
-        df.groupby("time_bucket", as_index=False)["avg_engagement_rate"]
-        .mean()
-        .sort_values("time_bucket")
-    )
-    series = overall["avg_engagement_rate"].tolist()
-    direction = _explain_trend_direction(series)
-    delta = _pct_delta(series[0] if series else None, series[-1] if series else None)
-    region_note = ""
-    if "trending_region" in df.columns and df["trending_region"].nunique() > 1:
-        per_region = (
-            df.groupby("trending_region")["avg_engagement_rate"]
-            .mean()
-            .sort_values(ascending=False)
-        )
-        if not per_region.empty:
-            region_note = (
-                f" Strongest region right now is **{per_region.index[0]}** "
-                f"at {_fmt_pct(per_region.iloc[0], 2)}."
-            )
-    if direction == "rising":
-        return f"Engagement rate is **rising** ({delta}) — viewers are interacting more per view.{region_note}"
-    if direction == "falling":
-        return f"Engagement rate is **falling** ({delta}) — viewers are watching but interacting less.{region_note}"
-    if direction == "volatile":
-        return f"Engagement rate is **volatile** across buckets — no clean trend yet.{region_note}"
-    return f"Engagement rate is **stable** ({delta}) around {_fmt_pct(series[-1] if series else None, 2)}.{region_note}"
-
-
-def _explain_channel_mix_shift(df) -> str:
-    if df.empty or "share" not in df.columns:
-        return "Not enough data to interpret channel mix."
-    pivot = (
-        df.pivot_table(
-            index="time_bucket",
-            columns="subscriber_tier",
-            values="share",
-            aggfunc="mean",
-        )
-        .fillna(0)
-        .sort_index()
-    )
-    if pivot.empty:
-        return "No channel-mix data."
-    first = pivot.iloc[0]
-    last = pivot.iloc[-1]
-    deltas = (last - first).sort_values(ascending=False)
-    if deltas.empty:
-        return "No tier changes detected."
-    rising_tier = deltas.index[0]
-    rising_delta = deltas.iloc[0]
-    falling_tier = deltas.index[-1]
-    falling_delta = deltas.iloc[-1]
-    dominant_tier = last.idxmax() if not last.empty else "n/a"
-    dominant_share = last.max() if not last.empty else 0
-    if abs(rising_delta) < 0.02 and abs(falling_delta) < 0.02:
-        return (
-            f"Channel-size mix is **steady** — **{dominant_tier}** carries about "
-            f"{_fmt_pct(dominant_share)} of trending and isn't budging."
-        )
-    return (
-        f"**{rising_tier}** creators are gaining share (**{_fmt_pct(rising_delta)}** swing), "
-        f"while **{falling_tier}** are losing ground ({_fmt_pct(falling_delta)}). "
-        f"Right now **{dominant_tier}** dominates at {_fmt_pct(dominant_share)} of trending."
-    )
-
-
-def _explain_duration_engagement(df) -> str:
-    if df.empty or "avg_engagement_rate" not in df.columns:
-        return "Not enough data to interpret duration vs engagement."
-    df_sorted = df.sort_values("avg_engagement_rate", ascending=False)
-    best = df_sorted.iloc[0]
-    worst = df_sorted.iloc[-1]
-    spread = float(best["avg_engagement_rate"]) - float(worst["avg_engagement_rate"])
-    if spread < 0.005:
-        return (
-            f"Engagement is **flat across duration buckets** (spread "
-            f"{_fmt_pct(spread, 2)}) — duration isn't really shaping engagement here."
-        )
-    return (
-        f"**{best['duration_bucket']}** wins on engagement at "
-        f"{_fmt_pct(best['avg_engagement_rate'], 2)}, vs {worst['duration_bucket']} at "
-        f"{_fmt_pct(worst['avg_engagement_rate'], 2)} — a {_fmt_pct(spread, 2)} gap."
-    )
-
-
-def _explain_duration_velocity(df) -> str:
-    if df.empty or "avg_velocity" not in df.columns:
-        return "Not enough data to interpret velocity by duration."
-    df_sorted = df.sort_values("avg_velocity", ascending=False)
-    best = df_sorted.iloc[0]
-    worst = df_sorted.iloc[-1]
-    if float(worst["avg_velocity"]) <= 0:
-        ratio_text = "much higher than"
-    else:
-        ratio = float(best["avg_velocity"]) / float(worst["avg_velocity"])
-        ratio_text = f"**{ratio:.1f}x** the velocity of"
-    return (
-        f"**{best['duration_bucket']}** videos rack up views fastest "
-        f"({_fmt_num(best['avg_velocity'])} avg velocity) — {ratio_text} "
-        f"the slowest bucket ({worst['duration_bucket']})."
-    )
-
-
-def _explain_duration_overindex(df) -> str:
-    if df.empty or "lift" not in df.columns:
-        return "Not enough data to interpret over-indexing."
-    over = df[df["lift"] > 1.25].sort_values("lift", ascending=False)
-    under = df[df["lift"] < 0.75].sort_values("lift")
-    if over.empty and under.empty:
-        return (
-            "Categories are spread roughly evenly across duration buckets — "
-            "no strong over- or under-indexing."
-        )
-    parts = []
-    if not over.empty:
-        top = over.iloc[0]
-        parts.append(
-            f"**{top['category_name']}** over-indexes in **{top['duration_bucket']}** "
-            f"(lift {top['lift']:.2f}x)"
-        )
-    if not under.empty:
-        bot = under.iloc[0]
-        parts.append(
-            f"**{bot['category_name']}** under-indexes in **{bot['duration_bucket']}** "
-            f"(lift {bot['lift']:.2f}x)"
-        )
-    return "; ".join(parts) + "."
-
-
-def _explain_duration_region(df) -> str:
-    if df.empty or "avg_engagement_rate" not in df.columns:
-        return "Not enough data."
-    best = df.sort_values("avg_engagement_rate", ascending=False).iloc[0]
-    worst = df.sort_values("avg_engagement_rate", ascending=True).iloc[0]
-    return (
-        f"Best engagement combo: **{best['duration_bucket']}** in **{best['trending_region']}** "
-        f"({_fmt_pct(best['avg_engagement_rate'], 2)}). Weakest: "
-        f"**{worst['duration_bucket']}** in **{worst['trending_region']}** "
-        f"({_fmt_pct(worst['avg_engagement_rate'], 2)})."
-    )
-
-
-def _explain_tag_frequency_engagement(df) -> str:
-    if df.empty or len(df) < 3:
-        return "Not enough tags to detect a pattern."
-    try:
-        corr = df["videos_using_tag"].corr(df["avg_engagement_rate"])
-    except Exception:
-        corr = None
-    if corr is None or pd.isna(corr):
-        return "Frequency vs engagement relationship is unclear."
-    if corr > 0.3:
-        return (
-            f"Frequency and engagement move **together** (corr {corr:+.2f}) — "
-            "the most-used tags are also among the higher-engagement ones."
-        )
-    if corr < -0.3:
-        return (
-            f"Frequency and engagement move **inversely** (corr {corr:+.2f}) — "
-            "high-frequency tags are actually under-performing on engagement."
-        )
-    return (
-        f"Frequency and engagement are **largely uncorrelated** (corr {corr:+.2f}) — "
-        "popular tags aren't a reliable signal of engagement on their own."
-    )
-
-
-def _explain_high_engagement_tags(df) -> str:
-    if df.empty:
-        return "No qualifying tags."
-    top = df.sort_values("avg_engagement_rate", ascending=False).head(3)
-    parts = [
-        f"**{row['tag']}** ({_fmt_pct(row['avg_engagement_rate'], 2)})"
-        for _, row in top.iterrows()
-    ]
-    return f"Top tags by engagement: {', '.join(parts)}."
-
-
-def _explain_tag_region_concentration(df) -> str:
-    if df.empty or "region_concentration" not in df.columns:
-        return "Not enough data."
-    by_tag = df.drop_duplicates("tag")[["tag", "region_concentration"]]
-    region_specific = by_tag[by_tag["region_concentration"] >= 0.7]
-    global_tags = by_tag[by_tag["region_concentration"] <= 0.4]
-    most_specific = by_tag.sort_values("region_concentration", ascending=False).iloc[0]
-    if not region_specific.empty and not global_tags.empty:
-        return (
-            f"**{len(region_specific)}** tags are highly region-specific (>=70% in one region) "
-            f"and **{len(global_tags)}** behave globally (<=40% concentration). "
-            f"Most concentrated: **{most_specific['tag']}** "
-            f"({_fmt_pct(most_specific['region_concentration'])})."
-        )
-    if not region_specific.empty:
-        return (
-            f"Most tags lean **region-specific** — "
-            f"**{len(region_specific)}** of {len(by_tag)} have >=70% concentration in one region."
-        )
-    return (
-        "Most tags here behave **globally** — usage is spread fairly evenly across regions."
-    )
-
-
-def _explain_tag_density(df) -> str:
-    if df.empty:
-        return "Not enough data."
-    order = ["0 tags", "1-5 tags", "6-10 tags", "11-20 tags", "21+ tags"]
-    df = df.copy()
-    df["__order"] = df["tag_density_bucket"].map({k: i for i, k in enumerate(order)})
-    df = df.sort_values("__order")
-    best = df.sort_values("avg_engagement_rate", ascending=False).iloc[0]
-    series = df["avg_engagement_rate"].tolist()
-    direction = _explain_trend_direction(series)
-    if direction == "rising":
-        shape = "increases as videos add more tags"
-    elif direction == "falling":
-        shape = "decreases as videos add more tags"
-    elif direction == "volatile":
-        shape = "moves unevenly across tag-density buckets"
-    else:
-        shape = "is roughly flat across tag-density buckets"
-    return (
-        f"Engagement {shape}. Sweet spot is **{best['tag_density_bucket']}** at "
-        f"{_fmt_pct(best['avg_engagement_rate'], 2)}."
-    )
-
-
-def _explain_subscriber_views(df) -> str:
-    if df.empty:
-        return "Not enough data."
-    best = df.sort_values("avg_views", ascending=False).iloc[0]
-    worst = df.sort_values("avg_views", ascending=True).iloc[0]
-    if float(worst["avg_views"]) <= 0:
-        ratio = "many times"
-    else:
-        ratio = f"{float(best['avg_views']) / float(worst['avg_views']):.1f}x"
-    return (
-        f"**{best['subscriber_tier']}** channels pull the most views per video "
-        f"({_fmt_int(best['avg_views'])}) — about **{ratio}** the **{worst['subscriber_tier']}** average."
-    )
-
-
-def _explain_subscriber_engagement(df) -> str:
-    if df.empty:
-        return "Not enough data."
-    best = df.sort_values("avg_engagement_rate", ascending=False).iloc[0]
-    worst = df.sort_values("avg_engagement_rate", ascending=True).iloc[0]
-    spread = float(best["avg_engagement_rate"]) - float(worst["avg_engagement_rate"])
-    if spread < 0.005:
-        return "Engagement is **roughly equal across tiers** — channel size doesn't drive engagement here."
-    return (
-        f"**{best['subscriber_tier']}** earns the highest engagement "
-        f"({_fmt_pct(best['avg_engagement_rate'], 2)}), versus **{worst['subscriber_tier']}** at "
-        f"{_fmt_pct(worst['avg_engagement_rate'], 2)} — a {_fmt_pct(spread, 2)} gap."
-    )
-
-
-def _explain_subscriber_persistence(df) -> str:
-    if df.empty:
-        return "Not enough data."
-    best = df.sort_values("avg_batches", ascending=False).iloc[0]
-    worst = df.sort_values("avg_batches", ascending=True).iloc[0]
-    return (
-        f"**{best['subscriber_tier']}** videos stay trending longest "
-        f"(avg **{_fmt_num(best['avg_batches'])}** batches), while "
-        f"**{worst['subscriber_tier']}** churn fastest at "
-        f"{_fmt_num(worst['avg_batches'])} batches."
-    )
-
-
-def _explain_subscriber_region(df) -> str:
-    if df.empty or "tier_share" not in df.columns:
-        return "Not enough data."
-    top = df.sort_values("tier_share", ascending=False).iloc[0]
-    return (
-        f"**{top['trending_region']}** leans most heavily on **{top['subscriber_tier']}** creators "
-        f"({_fmt_pct(top['tier_share'])} of that region's trending). Use this to spot regional "
-        f"creator-size biases."
-    )
-
-
-def _explain_new_vs_persisting(df) -> str:
+def _explain_views_new_vs_carryover(df) -> str:
     if df.empty or "videos" not in df.columns:
         return "Not enough data."
     pivot = (
-        df.pivot_table(
-            index="time_bucket",
-            columns="entry_status",
-            values="videos",
-            aggfunc="sum",
-        )
-        .fillna(0)
-        .sort_index()
+        df.pivot_table(index="time_bucket", columns="entry_status", values="videos", aggfunc="sum")
+        .fillna(0).sort_index()
     )
     if pivot.empty:
-        return "No data."
-    new_series = pivot.get("New entry", pd.Series(dtype=float)).tolist()
-    pers_series = pivot.get("Persisting", pd.Series(dtype=float)).tolist()
-    new_total = sum(new_series)
-    pers_total = sum(pers_series)
-    grand = new_total + pers_total
+        return "No videos in scope."
+    new_total = pivot.get("New entry", pd.Series(dtype=float)).sum()
+    carry_total = pivot.get("Carry-over", pd.Series(dtype=float)).sum()
+    grand = new_total + carry_total
     if grand == 0:
         return "No videos in scope."
     new_share = new_total / grand
-    new_dir = _explain_trend_direction(new_series) if new_series else "flat"
+    new_dir = _explain_trend_direction(pivot.get("New entry", pd.Series(dtype=float)).tolist())
     if new_share > 0.6:
-        flavor = "fed by **fresh entries** — most slots are new arrivals."
+        story = "fed by **fresh entries** — most slots are new arrivals."
     elif new_share < 0.3:
-        flavor = "carried by **persisting videos** — the same titles keep showing up."
+        story = "carried by **persisting videos** — the same titles keep showing up."
     else:
-        flavor = "a **balanced mix** of fresh entries and persisting videos."
-    return f"This category is {flavor} New-entry volume is **{new_dir}** over the window."
+        story = "a **balanced mix** of fresh entries and persisting videos."
+    return f"This category is {story} New-entry volume is **{new_dir}** over the window — that tells you whether the trend is being fed by churn or by compounding hits."
 
 
-def _explain_top_rank_concentration(df) -> str:
-    if df.empty or "top_rank_slots" not in df.columns:
+def _explain_duration_slot_footprint(df) -> str:
+    if df.empty or "distinct_videos" not in df.columns:
         return "Not enough data."
-    total = float(df["top_rank_slots"].sum())
-    if total == 0:
-        return "No top-rank slots in scope."
-    top = df.sort_values("top_rank_slots", ascending=False).iloc[0]
-    top_share = float(top["top_rank_slots"]) / total
-    top3_share = float(df.sort_values("top_rank_slots", ascending=False).head(3)["top_rank_slots"].sum()) / total
-    if top3_share > 0.6:
-        return (
-            f"Top-rank slots are **highly concentrated** — top 3 channels hold "
-            f"{_fmt_pct(top3_share)}, led by **{top['channel_title']}** at {_fmt_pct(top_share)}."
+    df = df.copy()
+    df["slot_footprint"] = df["distinct_videos"] * df["avg_batches_per_video"]
+    top = df.sort_values("slot_footprint", ascending=False).iloc[0]
+    bucket = top["duration_bucket"]
+    vids = int(top["distinct_videos"])
+    persist = float(top["avg_batches_per_video"])
+    # Decide whether dominance is volume-driven or persistence-driven by
+    # comparing this bucket's two levers against the others.
+    others = df[df["duration_bucket"] != bucket]
+    median_vids = float(others["distinct_videos"].median()) if not others.empty else 0
+    median_persist = float(others["avg_batches_per_video"].median()) if not others.empty else 0
+    vol_lead = vids > median_vids * 1.5 if median_vids else True
+    persist_lead = persist > median_persist * 1.5 if median_persist else False
+    if vol_lead and persist_lead:
+        story = (
+            f"**{bucket}** dominates because BOTH levers are large — "
+            f"{vids} distinct videos × {persist:.1f} avg batches each."
         )
-    if top3_share < 0.35:
+    elif vol_lead:
+        story = (
+            f"**{bucket}** dominates as a **volume game** — "
+            f"{vids} distinct videos churn through trending, each lasting only {persist:.1f} batches."
+        )
+    elif persist_lead:
+        story = (
+            f"**{bucket}** dominates as a **persistence game** — only {vids} distinct videos, "
+            f"but each holds its slot for {persist:.1f} batches on average."
+        )
+    else:
+        story = (
+            f"**{bucket}** has the largest slot footprint ({vids} videos × {persist:.1f} batches) — "
+            "no single lever is doing all the work."
+        )
+    return story
+
+
+def _explain_duration_audience_response(df) -> str:
+    if df.empty or "avg_engagement_rate" not in df.columns:
+        return "Not enough data."
+    er_best = df.sort_values("avg_engagement_rate", ascending=False).iloc[0]
+    views_best = df.sort_values("avg_views_per_video", ascending=False).iloc[0]
+    if er_best["duration_bucket"] == views_best["duration_bucket"]:
         return (
-            f"Top-rank slots are **broadly distributed** — top 3 channels hold only "
-            f"{_fmt_pct(top3_share)}; no single channel dominates."
+            f"**{er_best['duration_bucket']}** wins on BOTH avg engagement "
+            f"({_fmt_pct(er_best['avg_engagement_rate'], 2)}) and avg views "
+            f"({_fmt_int(er_best['avg_views_per_video'])}) — viewers genuinely prefer this length here."
         )
     return (
-        f"Top-rank distribution is **moderately concentrated** — top 3 channels hold "
-        f"{_fmt_pct(top3_share)}, with **{top['channel_title']}** leading at {_fmt_pct(top_share)}."
+        f"Engagement leads with **{er_best['duration_bucket']}** "
+        f"({_fmt_pct(er_best['avg_engagement_rate'], 2)}), while views per video lead with "
+        f"**{views_best['duration_bucket']}** ({_fmt_int(views_best['avg_views_per_video'])}). "
+        "The two don't agree — slot dominance probably isn't an audience-preference story."
     )
 
 
-def _explain_velocity_vs_rank(df) -> str:
-    if df.empty or len(df) < 3:
-        return "Not enough videos to detect a pattern."
-    try:
-        # Negative correlation = high velocity → low (better) rank.
-        corr = df["avg_velocity"].corr(df["best_rank"])
-    except Exception:
-        corr = None
-    if corr is None or pd.isna(corr):
-        return "Velocity vs rank relationship is unclear."
-    if corr < -0.3:
-        return (
-            f"Velocity strongly drives rank (corr {corr:+.2f}) — "
-            "higher-velocity videos consistently land **better** trending ranks."
+def _explain_tier_effort_reward(df) -> str:
+    if df.empty or "distinct_channels" not in df.columns:
+        return "Not enough data."
+    df = df.copy()
+    df["total_slots"] = df["distinct_channels"] * df["avg_slots_per_channel"]
+    top = df.sort_values("total_slots", ascending=False).iloc[0]
+    others = df[df["subscriber_tier"] != top["subscriber_tier"]]
+    median_channels = float(others["distinct_channels"].median()) if not others.empty else 0
+    median_avg = float(others["avg_slots_per_channel"].median()) if not others.empty else 0
+    broad = top["distinct_channels"] > median_channels * 1.5 if median_channels else True
+    intense = top["avg_slots_per_channel"] > median_avg * 1.5 if median_avg else False
+    if broad and intense:
+        story = (
+            f"**{top['subscriber_tier']}** dominates with BOTH wide participation "
+            f"({int(top['distinct_channels'])} channels) AND high per-channel intensity "
+            f"({top['avg_slots_per_channel']:.1f} slots each)."
         )
-    if corr > 0.3:
+    elif broad:
+        story = (
+            f"**{top['subscriber_tier']}** dominates through **broad participation** — "
+            f"{int(top['distinct_channels'])} channels each contributing only "
+            f"{top['avg_slots_per_channel']:.1f} slots on average."
+        )
+    elif intense:
+        story = (
+            f"**{top['subscriber_tier']}** dominates through **concentrated intensity** — "
+            f"only {int(top['distinct_channels'])} channels, but each holds "
+            f"{top['avg_slots_per_channel']:.1f} slots."
+        )
+    else:
+        story = (
+            f"**{top['subscriber_tier']}** leads with {int(top['distinct_channels'])} channels × "
+            f"{top['avg_slots_per_channel']:.1f} slots each — neither lever is overwhelming."
+        )
+    return story
+
+
+def _explain_tier_persistence_engagement(df) -> str:
+    if df.empty or "avg_batches_per_video" not in df.columns:
+        return "Not enough data."
+    persist_top = df.sort_values("avg_batches_per_video", ascending=False).iloc[0]
+    er_top = df.sort_values("avg_engagement_rate", ascending=False).iloc[0]
+    if persist_top["subscriber_tier"] == er_top["subscriber_tier"]:
         return (
-            f"Velocity and rank move **against expectation** (corr {corr:+.2f}) — "
-            "high-velocity videos aren't translating into top ranks here."
+            f"**{persist_top['subscriber_tier']}** holds slots through BOTH stickiness "
+            f"({persist_top['avg_batches_per_video']:.1f} avg batches) and audience response "
+            f"({_fmt_pct(persist_top['avg_engagement_rate'], 2)} ER) — the strongest tier all around."
         )
     return (
-        f"Velocity has a **weak link** to rank (corr {corr:+.2f}) — other factors "
-        "(timing, channel size, topic) are doing more of the work."
+        f"**{persist_top['subscriber_tier']}** sticks longest "
+        f"({persist_top['avg_batches_per_video']:.1f} avg batches), but **{er_top['subscriber_tier']}** "
+        f"earns better engagement ({_fmt_pct(er_top['avg_engagement_rate'], 2)}). "
+        "Different tiers win on different mechanics here."
     )
 
 
-def _explain_share_drivers(df) -> str:
-    if df.empty:
+def _explain_tag_adoption_intensity(df) -> str:
+    if df.empty or "distinct_channels" not in df.columns:
+        return "Not enough tag data in scope."
+    df = df.copy()
+    median_channels = df["distinct_channels"].median()
+    median_per_channel = df["videos_per_channel"].median()
+    broadly_adopted = df[
+        (df["distinct_channels"] >= median_channels) & (df["videos_per_channel"] < median_per_channel)
+    ]
+    flooders = df[
+        (df["distinct_channels"] < median_channels) & (df["videos_per_channel"] >= median_per_channel)
+    ]
+    parts = []
+    if not broadly_adopted.empty:
+        b = broadly_adopted.iloc[0]
+        parts.append(
+            f"**{b['tag']}** is broadly adopted ({int(b['distinct_channels'])} channels, "
+            f"{b['videos_per_channel']:.2f} videos/channel) — many creators, light intensity."
+        )
+    if not flooders.empty:
+        f0 = flooders.iloc[0]
+        parts.append(
+            f"**{f0['tag']}** is flooded by a few channels "
+            f"({int(f0['distinct_channels'])} channels × {f0['videos_per_channel']:.2f} videos each)."
+        )
+    if not parts:
+        top = df.sort_values("videos_using_tag", ascending=False).iloc[0]
+        return (
+            f"**{top['tag']}** leads with {int(top['distinct_channels'])} channels averaging "
+            f"{top['videos_per_channel']:.2f} videos each — balanced adoption."
+        )
+    return " ".join(parts)
+
+
+def _explain_tag_cooccurrence(df) -> str:
+    if df.empty or "co_videos" not in df.columns:
+        return "Not enough data to compute co-occurrence."
+    primary = df["primary_tag"].iloc[0] if "primary_tag" in df.columns and len(df) else "?"
+    df_sorted = df.sort_values("co_videos", ascending=False)
+    top = df_sorted.iloc[0]
+    top_share = float(top.get("co_share", 0.0))
+    if top_share >= 0.6:
+        story = (
+            f"**{primary}** travels with **{top['tag']}** {_fmt_pct(top_share)} of the time — "
+            "strong template effect; the dominance is at least partly carried by a co-tag pattern."
+        )
+    elif top_share >= 0.3:
+        story = (
+            f"**{primary}** most often co-occurs with **{top['tag']}** "
+            f"({_fmt_pct(top_share)}) — moderate template effect."
+        )
+    else:
+        story = (
+            f"**{primary}**'s co-occurrences are spread out (top partner **{top['tag']}** at only "
+            f"{_fmt_pct(top_share)}) — the tag is genuinely versatile, not riding a template."
+        )
+    return story
+
+
+def _explain_rank_slot_turnover(df) -> str:
+    if df.empty or "turnover_rate" not in df.columns:
         return "Not enough data."
-    df = df.sort_values("time_bucket")
-    videos_dir = _explain_trend_direction(df["unique_videos"].tolist())
-    avg_views_dir = _explain_trend_direction(df["avg_views_per_video"].tolist())
-    if videos_dir == "rising" and avg_views_dir == "rising":
-        return "Share is rising on **both fronts** — more videos AND each video is getting bigger."
-    if videos_dir == "rising" and avg_views_dir != "rising":
-        return "Growth is **volume-led** — more videos are entering trending, not stronger individual performances."
-    if videos_dir != "rising" and avg_views_dir == "rising":
-        return "Growth is **strength-led** — same number of videos, but each one is pulling more views."
-    if videos_dir == "falling" and avg_views_dir == "falling":
-        return "Share is **shrinking on both fronts** — fewer videos and weaker individual reach."
+    avg_rate = float(df["turnover_rate"].mean())
+    distinct = int(df["distinct_videos"].sum())
+    if avg_rate >= 0.5:
+        story = (
+            f"Turnover is **high** (avg {avg_rate:.2f}) — {distinct} distinct videos rotated through "
+            "this category's slots. Vibrant pipeline, lots of new entrants competing."
+        )
+    elif avg_rate <= 0.2:
+        story = (
+            f"Turnover is **low** (avg {avg_rate:.2f}) — only {distinct} distinct videos held the slots. "
+            "Stale pipeline; a few persistent videos are hogging the category."
+        )
+    else:
+        story = (
+            f"Turnover is **moderate** (avg {avg_rate:.2f}) — {distinct} distinct videos through the slots. "
+            "Some rotation, some persistence."
+        )
+    return story
+
+
+def _explain_rank_channel_concentration_v2(df) -> str:
+    if df.empty or "share_pct" not in df.columns:
+        return "Not enough data."
+    df_sorted = df.sort_values("share_pct", ascending=False)
+    top3_share = float(df_sorted.head(3)["share_pct"].sum())
+    top1 = df_sorted.iloc[0]
+    if top3_share >= 60:
+        return (
+            f"Top 3 channels hold **{top3_share:.1f}%** of this category's slot observations, led by "
+            f"**{top1['channel_title']}** at {top1['share_pct']:.1f}%. **Highly concentrated** — "
+            "the category dominance is really a few-channel story."
+        )
+    if top3_share <= 30:
+        return (
+            f"Top 3 channels hold only **{top3_share:.1f}%** — **broadly distributed**. "
+            "The category dominance comes from many creators contributing, not a small cartel."
+        )
     return (
-        f"Volume is {videos_dir}, per-video reach is {avg_views_dir} — "
-        "no single driver is dominating right now."
+        f"Top 3 channels hold **{top3_share:.1f}%**, with **{top1['channel_title']}** "
+        f"leading at {top1['share_pct']:.1f}%. **Moderately concentrated**."
     )
 
 
@@ -988,238 +921,95 @@ def load_filter_source():
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_velocity_shift_diagnostic(category_name: str, trending_region: str | None, history_window: str):
-    sdf = build_velocity_shift_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
+# --- v2 diagnostic loaders (one pair per descriptive chart) ---------------
+# Each pair mechanically decomposes the trend the descriptive chart shows.
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_views_volume_strength_diagnostic(category_name: str, trending_region: str | None, history_window: str):
+    sdf = build_views_volume_strength_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_persistence_distribution_diagnostic(category_name: str, trending_region: str | None, history_window: str):
-    sdf = build_persistence_distribution_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_views_new_vs_carryover_diagnostic(category_name: str, trending_region: str | None, history_window: str):
+    sdf = build_views_new_vs_carryover_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_engagement_shift_diagnostic(category_name: str, trending_region: str | None, history_window: str):
-    sdf = build_engagement_shift_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_duration_slot_footprint_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
+    sdf = build_duration_slot_footprint_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_channel_mix_shift_diagnostic(category_name: str, trending_region: str | None, history_window: str):
-    sdf = build_channel_mix_shift_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_duration_audience_response_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
+    sdf = build_duration_audience_response_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_duration_engagement_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
-    sdf = build_duration_engagement_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_tier_effort_reward_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
+    sdf = build_tier_effort_reward_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_duration_velocity_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
-    sdf = build_duration_velocity_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_tier_persistence_engagement_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
+    sdf = build_tier_persistence_engagement_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_duration_category_overindex_diagnostic(trending_region: str | None, history_window: str):
-    sdf = build_duration_category_overindex_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        trending_region=trending_region,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_tag_adoption_intensity_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
+    sdf = build_tag_adoption_intensity_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_duration_region_diagnostic(category_name: str | None, history_window: str):
-    sdf = build_duration_region_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_tag_cooccurrence_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
+    sdf = build_tag_cooccurrence_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_subscriber_views_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
-    sdf = build_subscriber_views_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_rank_slot_turnover_diagnostic(category_name: str, trending_region: str | None, history_window: str):
+    sdf = build_rank_slot_turnover_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_subscriber_engagement_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
-    sdf = build_subscriber_engagement_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_subscriber_persistence_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
-    sdf = build_subscriber_persistence_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_subscriber_region_diagnostic(category_name: str | None, history_window: str):
-    sdf = build_subscriber_region_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_rank_new_vs_persisting_diagnostic(category_name: str, trending_region: str | None, history_window: str):
-    sdf = build_rank_new_vs_persisting_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_top_rank_channel_concentration_diagnostic(category_name: str, trending_region: str | None, history_window: str):
-    sdf = build_top_rank_channel_concentration_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_velocity_vs_rank_diagnostic(category_name: str, trending_region: str | None, history_window: str):
-    sdf = build_velocity_vs_rank_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_category_share_drivers_diagnostic(category_name: str, trending_region: str | None, history_window: str):
-    sdf = build_category_share_drivers_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_tag_effectiveness_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
-    sdf = build_tag_effectiveness_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_high_engagement_tags_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
-    sdf = build_high_engagement_tags_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_tag_region_concentration_diagnostic(category_name: str | None, history_window: str):
-    sdf = build_tag_region_concentration_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-    )
-    return _safe_pandas_from_spark(sdf)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def load_tag_density_performance_diagnostic(category_name: str | None, trending_region: str | None, history_window: str):
-    sdf = build_tag_density_performance_diagnostic(
-        get_spark(),
-        SILVER_DELTA_PATH,
-        history_window,
-        category_name=category_name,
-        trending_region=trending_region,
+@st.cache_data(ttl=120, show_spinner=False)
+def load_rank_channel_concentration_v2_diagnostic(category_name: str, trending_region: str | None, history_window: str):
+    sdf = build_rank_channel_concentration_v2_diagnostic(
+        get_spark(), SILVER_DELTA_PATH, history_window,
+        category_name=category_name, trending_region=trending_region,
     )
     return _safe_pandas_from_spark(sdf)
 
@@ -1229,6 +1019,10 @@ gold_category_summary_df = load_optional_delta(GOLD_CATEGORY_SUMMARY_PATH)
 gold_views_timeseries_df = load_optional_delta(GOLD_VIEWS_TIMESERIES_PATH)
 gold_region_timeseries_df = load_optional_delta(GOLD_REGION_TIMESERIES_PATH)
 gold_channel_leaderboard_df = load_optional_delta(GOLD_CHANNEL_LEADERBOARD_PATH)
+gold_duration_distribution_df = load_optional_delta(GOLD_DURATION_DISTRIBUTION_PATH)
+gold_subscriber_tier_df = load_optional_delta(GOLD_SUBSCRIBER_TIER_PATH)
+gold_tag_usage_df = load_optional_delta(GOLD_TAG_USAGE_PATH)
+gold_trending_rank_dist_df = load_optional_delta(GOLD_TRENDING_RANK_DIST_PATH)
 
 st.sidebar.header("Filters")
 
@@ -1270,60 +1064,208 @@ if df.empty:
     st.warning("No Silver data matched the selected filters/window. Gold summary tables may still populate some charts.")
     st.stop()
 
-use_gold_category_summary = (
-    not gold_category_summary_df.empty and selected_region == "All" and selected_category == "All"
+# --- Gold-first descriptive aggregations ---------------------------------
+# All tab-1 charts read pre-aggregated Gold parquet whenever it is available
+# (a tiny in-memory pandas filter against a small table — milliseconds).
+# Spark on Silver is only the fallback path when the Gold table is missing
+# (e.g. on a brand-new install before refresh_gold_tables has run).
+
+def _filter_gold(df, category, region):
+    if df is None or df.empty:
+        return df
+    out = df
+    if category and "category_name" in out.columns:
+        out = out[out["category_name"] == category]
+    if region and "trending_region" in out.columns:
+        out = out[out["trending_region"] == region]
+    return out
+
+
+# --- category summary --------------------------------------------------
+# The new schema is per (category_name, trending_region) with extra sum_*
+# columns. Older Gold files on disk only have category_name, so we detect
+# the schema and pick the right path. This keeps the dashboard alive on
+# old Gold until refresh_gold_tables runs again.
+_cs_has_region = (
+    not gold_category_summary_df.empty
+    and "trending_region" in gold_category_summary_df.columns
 )
-# --- Spark-driven descriptive aggregations -------------------------------
-# All tab-1 (descriptive) tables are computed by reading the Silver Delta
-# layer directly with Spark and aggregating there. Pandas is used ONLY at
-# the very last step (via _safe_pandas_from_spark) because Streamlit /
-# Altair render via pandas/Arrow.
-summary_df = (
-    gold_category_summary_df
-    if use_gold_category_summary
-    else load_spark_category_summary(diagnostic_category, diagnostic_region, history_window)
+_cs_has_sums = (
+    _cs_has_region
+    and {"sum_engagement_rate", "sum_like_rate", "sample_size"}.issubset(
+        gold_category_summary_df.columns
+    )
 )
 
-use_gold_views_ts = (
-    not gold_views_timeseries_df.empty and selected_region == "All" and selected_category == "All"
-)
-views_ts_df = (
-    gold_views_timeseries_df
-    if use_gold_views_ts
-    else load_spark_views_timeseries(diagnostic_category, diagnostic_region, history_window)
-)
+if _cs_has_region:
+    cs_filtered = _filter_gold(gold_category_summary_df, diagnostic_category, diagnostic_region)
+    if cs_filtered.empty:
+        summary_df = cs_filtered
+    elif diagnostic_region is not None:
+        summary_df = cs_filtered.copy()
+    elif _cs_has_sums:
+        agg = cs_filtered.groupby("category_name", as_index=False).agg(
+            videos=("videos", "sum"),
+            total_views=("total_views", "sum"),
+            total_likes=("total_likes", "sum"),
+            total_comments=("total_comments", "sum"),
+            sum_engagement_rate=("sum_engagement_rate", "sum"),
+            sum_like_rate=("sum_like_rate", "sum"),
+            sample_size=("sample_size", "sum"),
+        )
+        agg["avg_engagement_rate"] = (
+            agg["sum_engagement_rate"] / agg["sample_size"].replace(0, pd.NA)
+        ).fillna(0)
+        agg["avg_like_rate"] = (
+            agg["sum_like_rate"] / agg["sample_size"].replace(0, pd.NA)
+        ).fillna(0)
+        summary_df = agg.sort_values("total_views", ascending=False)
+    else:
+        # Region in schema but no sum_* columns — older transitional Gold.
+        # Roll up sums correctly, weight averages by `videos`.
+        agg = cs_filtered.groupby("category_name", as_index=False).agg(
+            videos=("videos", "sum"),
+            total_views=("total_views", "sum"),
+            total_likes=("total_likes", "sum"),
+            total_comments=("total_comments", "sum"),
+            avg_engagement_rate_x_videos=(
+                "avg_engagement_rate",
+                lambda s: float((s * cs_filtered.loc[s.index, "videos"]).sum()),
+            ),
+            avg_like_rate_x_videos=(
+                "avg_like_rate",
+                lambda s: float((s * cs_filtered.loc[s.index, "videos"]).sum()),
+            ),
+        )
+        agg["avg_engagement_rate"] = (
+            agg["avg_engagement_rate_x_videos"] / agg["videos"].replace(0, pd.NA)
+        ).fillna(0)
+        agg["avg_like_rate"] = (
+            agg["avg_like_rate_x_videos"] / agg["videos"].replace(0, pd.NA)
+        ).fillna(0)
+        summary_df = agg.drop(
+            columns=["avg_engagement_rate_x_videos", "avg_like_rate_x_videos"]
+        ).sort_values("total_views", ascending=False)
+elif not gold_category_summary_df.empty and selected_region == "All" and selected_category == "All":
+    # Old Gold (no region column) only safe to use when no filters are set.
+    summary_df = gold_category_summary_df
+else:
+    summary_df = load_spark_category_summary(diagnostic_category, diagnostic_region, history_window)
 
-duration_dist_df = load_spark_duration_distribution(diagnostic_category, diagnostic_region, history_window)
-subscriber_tier_df = load_spark_subscriber_tier_distribution(diagnostic_category, diagnostic_region, history_window)
-tag_usage_df = load_spark_tag_usage_frequency(diagnostic_category, diagnostic_region, history_window)
-trending_rank_dist_df = load_spark_trending_rank_distribution(diagnostic_category, diagnostic_region, history_window)
+# --- views timeseries --------------------------------------------------
+_vt_has_region = (
+    not gold_views_timeseries_df.empty
+    and "trending_region" in gold_views_timeseries_df.columns
+)
+if _vt_has_region:
+    vt_filtered = _filter_gold(gold_views_timeseries_df, diagnostic_category, diagnostic_region)
+    if vt_filtered.empty:
+        views_ts_df = vt_filtered
+    elif diagnostic_region is not None:
+        views_ts_df = vt_filtered.copy()
+    else:
+        views_ts_df = (
+            vt_filtered.groupby(["category_name", "time_bucket"], as_index=False)
+            .agg(
+                total_views=("total_views", "sum"),
+                total_engagements=("total_engagements", "sum"),
+            )
+        )
+elif not gold_views_timeseries_df.empty and selected_region == "All" and selected_category == "All":
+    views_ts_df = gold_views_timeseries_df
+else:
+    views_ts_df = load_spark_views_timeseries(diagnostic_category, diagnostic_region, history_window)
 
-# --- Predictive / prescriptive pipeline (still pandas-backed) ------------
+if not gold_duration_distribution_df.empty:
+    duration_dist_df = _filter_gold(gold_duration_distribution_df, diagnostic_category, diagnostic_region)
+else:
+    duration_dist_df = load_spark_duration_distribution(diagnostic_category, diagnostic_region, history_window)
+
+if not gold_subscriber_tier_df.empty:
+    # Gold stores per (region, category, tier). Filter on user selection,
+    # then re-aggregate to (region, tier) and recompute share within region
+    # so the chart still shows correct percentages under any filter combo.
+    sub_filtered = _filter_gold(gold_subscriber_tier_df, diagnostic_category, diagnostic_region)
+    if sub_filtered.empty:
+        subscriber_tier_df = sub_filtered
+    else:
+        sub_agg = (
+            sub_filtered.groupby(["trending_region", "subscriber_tier"], as_index=False)
+            ["video_count"].sum()
+        )
+        region_totals = sub_agg.groupby("trending_region")["video_count"].sum()
+        sub_agg["pct"] = (
+            sub_agg["video_count"] / sub_agg["trending_region"].map(region_totals) * 100.0
+        ).fillna(0)
+        subscriber_tier_df = sub_agg
+else:
+    subscriber_tier_df = load_spark_subscriber_tier_distribution(diagnostic_category, diagnostic_region, history_window)
+
+if not gold_tag_usage_df.empty:
+    # Gold stores per (tag, region, category). Filter on user selection, sum
+    # videos_using_tag per tag, take top 30, then attach the dominant
+    # (category, region) for each top tag so the chart still has color/tooltip.
+    tag_filtered = _filter_gold(gold_tag_usage_df, diagnostic_category, diagnostic_region)
+    if tag_filtered.empty:
+        tag_usage_df = tag_filtered
+    else:
+        top_tags = (
+            tag_filtered.groupby("tag", as_index=False)["videos_using_tag"].sum()
+            .sort_values("videos_using_tag", ascending=False)
+            .head(30)
+        )
+        # Dominant (category, region) per top tag.
+        dominant = (
+            tag_filtered.merge(top_tags[["tag"]], on="tag", how="inner")
+            .sort_values("videos_using_tag", ascending=False)
+            .drop_duplicates("tag")
+            [["tag", "category_name", "trending_region"]]
+        )
+        tag_usage_df = top_tags.merge(dominant, on="tag", how="left")
+else:
+    tag_usage_df = load_spark_tag_usage_frequency(diagnostic_category, diagnostic_region, history_window)
+
+if not gold_trending_rank_dist_df.empty:
+    # Gold already stores video_count and pct_of_trending per (region, category)
+    # against the full region total — that share remains valid under category
+    # filtering (it's still "% of THAT region's trending slots").
+    trending_rank_dist_df = _filter_gold(gold_trending_rank_dist_df, diagnostic_category, diagnostic_region)
+else:
+    trending_rank_dist_df = load_spark_trending_rank_distribution(diagnostic_category, diagnostic_region, history_window)
+
+# --- Predictive pipeline (still pandas-backed) ---------------------------
 # These wrap sklearn / regression code that genuinely needs numpy/pandas
-# arrays, so the legacy pandas-based builders remain for tab 2 and tab 3.
-entry_probability_df = build_trending_entry_probability(df)
+# arrays, so the legacy pandas-based builders remain for tab 2.
 video_forecast_df = build_view_count_forecast_v2(df)
 duration_prediction_df = build_trending_duration_prediction(df)
 peak_rank_forecast_df = build_peak_rank_forecast(df)
 category_share_forecast_df = build_category_share_forecast(df)
-optimal_posting_df = build_optimal_posting_window(df)
-gap_opportunity_df = build_trending_gap_opportunity(df)
-creator_partnership_df = build_creator_partnership_recommendations(df)
-format_prescriptions_df = build_format_prescriptions(df)
-campaign_alerts_df = build_campaign_timing_alerts(df)
-regional_expansion_df = build_regional_expansion_recommendations(df)
 
 
 # KPI metrics — computed entirely in Spark.
 kpis = load_spark_kpis(diagnostic_category, diagnostic_region, history_window)
+
+
+def _human_readable_views(n: int) -> str:
+    """Compact view count: 1.2B / 345M / 12K so the metric tile stays readable."""
+    n = int(n or 0)
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n:,}"
+
+
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Unique Videos", f"{kpis['unique_videos']:,}")
-k2.metric("Total Views", f"{kpis['total_views']:,}")
+k2.metric("Total Views", _human_readable_views(kpis["total_views"]))
 k3.metric("Avg Engagement Rate", f"{kpis['avg_engagement_rate'] * 100:.2f}%")
 k4.metric("Tracked Categories", f"{kpis['tracked_categories']:,}")
 
-tab1, tab2, tab3 = st.tabs(
-    ["Descriptive", "Predictive", "Prescriptive"]
+tab1, tab2 = st.tabs(
+    ["Descriptive", "Predictive"]
 )
 
 with tab1:
@@ -1429,167 +1371,87 @@ with tab1:
             )
 
         if selected_views_category:
-            diagnostic_region = None if selected_region == "All" else selected_region
-            velocity_diag_df = load_velocity_shift_diagnostic(
-                str(selected_views_category),
-                diagnostic_region,
-                history_window,
+            diagnostic_region_local = None if selected_region == "All" else selected_region
+            volume_strength_df = load_views_volume_strength_diagnostic(
+                str(selected_views_category), diagnostic_region_local, history_window,
             )
-            persistence_diag_df = load_persistence_distribution_diagnostic(
-                str(selected_views_category),
-                diagnostic_region,
-                history_window,
-            )
-            engagement_shift_df = load_engagement_shift_diagnostic(
-                str(selected_views_category),
-                diagnostic_region,
-                history_window,
-            )
-            channel_mix_df = load_channel_mix_shift_diagnostic(
-                str(selected_views_category),
-                diagnostic_region,
-                history_window,
+            new_carryover_df = load_views_new_vs_carryover_diagnostic(
+                str(selected_views_category), diagnostic_region_local, history_window,
             )
 
             st.markdown(
-                f"**Diagnostics for `{selected_views_category}`**"
-                + (f" in `{diagnostic_region}`" if diagnostic_region else "")
+                f"**Why is `{selected_views_category}` moving?**"
+                + (f" in `{diagnostic_region_local}`" if diagnostic_region_local else "")
             )
             diag_col1, diag_col2 = st.columns(2)
 
             with diag_col1:
-                if velocity_diag_df.empty:
-                    st.info("No velocity diagnostic data available for this selection.")
+                st.markdown("**Diagnostic 1: Volume vs Strength Decomposition**")
+                st.caption("Total views = unique videos × avg views per video. Tells you which lever moved.")
+                if volume_strength_df.empty:
+                    st.info("Not enough data for this category yet.")
                 else:
-                    velocity_chart = (
-                        alt.Chart(velocity_diag_df)
-                        .mark_line(point=True)
-                        .encode(
-                            x=alt.X("time_bucket:T", title="Time"),
-                            y=alt.Y("avg_velocity:Q", title="Average Velocity"),
-                            tooltip=[
-                                alt.Tooltip("time_bucket:T", title="Time"),
-                                alt.Tooltip("avg_velocity:Q", title="Avg Velocity", format=",.2f"),
-                                alt.Tooltip(
-                                    "avg_engagement_rate:Q",
-                                    title="Avg Engagement Rate",
-                                    format=".2%",
-                                ),
-                                alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                            ],
-                        )
-                        .properties(height=300, title="Diagnostic 1: Velocity Shift")
+                    volume_strength_chart = (
+                        alt.Chart(volume_strength_df).encode(x=alt.X("time_bucket:T", title="Time"))
                     )
-                    st.altair_chart(velocity_chart, width="stretch")
-                    _explanation(_explain_velocity_shift(velocity_diag_df))
+                    videos_line = volume_strength_chart.mark_line(point=True, color="#0ea5e9").encode(
+                        y=alt.Y(
+                            "unique_videos:Q",
+                            title="Unique Videos",
+                            axis=alt.Axis(titleColor="#0ea5e9"),
+                        ),
+                        tooltip=[
+                            alt.Tooltip("time_bucket:T", title="Time"),
+                            alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
+                            alt.Tooltip("avg_views_per_video:Q", title="Avg Views/Video", format=","),
+                            alt.Tooltip("total_views:Q", title="Total Views", format=","),
+                        ],
+                    )
+                    avg_line = volume_strength_chart.mark_line(point=True, color="#f59e0b").encode(
+                        y=alt.Y(
+                            "avg_views_per_video:Q",
+                            title="Avg Views per Video",
+                            axis=alt.Axis(format="~s", titleColor="#f59e0b"),
+                        ),
+                    )
+                    st.altair_chart(
+                        alt.layer(videos_line, avg_line)
+                        .resolve_scale(y="independent")
+                        .properties(height=320),
+                        width="stretch",
+                    )
+                    _explanation(_explain_views_volume_strength(volume_strength_df))
 
             with diag_col2:
-                if persistence_diag_df.empty:
-                    st.info("No persistence diagnostic data available for this selection.")
+                st.markdown("**Diagnostic 2: New Entrants vs Carry-overs**")
+                st.caption("Where are the videos in this category coming from each bucket — fresh entries, or returning?")
+                if new_carryover_df.empty:
+                    st.info("Not enough data for this category yet.")
                 else:
-                    persistence_order = ["1 batch", "2-3 batches", "4-6 batches", "7+ batches"]
-                    persistence_chart = (
-                        alt.Chart(persistence_diag_df)
+                    new_carry_chart = (
+                        alt.Chart(new_carryover_df)
                         .mark_bar()
                         .encode(
-                            x=alt.X(
-                                "persistence_bucket:N",
-                                sort=persistence_order,
-                                title="Persistence Bucket",
-                            ),
-                            y=alt.Y("video_count:Q", title="Video Count"),
-                            tooltip=[
-                                "persistence_bucket",
-                                alt.Tooltip("video_count:Q", title="Videos", format=","),
-                                alt.Tooltip("avg_peak_views:Q", title="Avg Peak Views", format=","),
-                            ],
-                        )
-                        .properties(height=300, title="Diagnostic 2: Trending Persistence")
-                    )
-                    st.altair_chart(persistence_chart, width="stretch")
-                    _explanation(_explain_persistence_distribution(persistence_diag_df))
-
-            diag_col3, diag_col4 = st.columns(2)
-
-            with diag_col3:
-                if engagement_shift_df.empty:
-                    st.info("No engagement-rate diagnostic data available for this selection.")
-                else:
-                    engagement_shift_chart = (
-                        alt.Chart(engagement_shift_df)
-                        .mark_line(point=True)
-                        .encode(
                             x=alt.X("time_bucket:T", title="Time"),
-                            y=alt.Y(
-                                "avg_engagement_rate:Q",
-                                title="Avg Engagement Rate",
-                                axis=alt.Axis(format=".1%"),
-                            ),
-                            color=alt.Color("trending_region:N", title="Region"),
-                            tooltip=[
-                                alt.Tooltip("time_bucket:T", title="Time"),
-                                alt.Tooltip("trending_region:N", title="Region"),
-                                alt.Tooltip(
-                                    "avg_engagement_rate:Q",
-                                    title="Avg Engagement Rate",
-                                    format=".2%",
-                                ),
-                                alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                                alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                            ],
-                        )
-                        .properties(
-                            height=300,
-                            title="Diagnostic 3: Engagement Rate Shift Over Time",
-                        )
-                    )
-                    st.altair_chart(engagement_shift_chart, width="stretch")
-                    _explanation(_explain_engagement_shift(engagement_shift_df))
-
-            with diag_col4:
-                if channel_mix_df.empty:
-                    st.info("No channel-mix diagnostic data available for this selection.")
-                else:
-                    tier_order = [
-                        "Small (<100K)",
-                        "Mid (100K-1M)",
-                        "Large (1M-10M)",
-                        "Mega (10M+)",
-                    ]
-                    channel_mix_chart = (
-                        alt.Chart(channel_mix_df)
-                        .mark_area()
-                        .encode(
-                            x=alt.X("time_bucket:T", title="Time"),
-                            y=alt.Y(
-                                "share:Q",
-                                stack="normalize",
-                                title="Share of Trending Videos",
-                                axis=alt.Axis(format=".0%"),
-                            ),
+                            y=alt.Y("videos:Q", title="Distinct Videos", stack="zero"),
                             color=alt.Color(
-                                "subscriber_tier:N",
-                                title="Channel Size",
-                                sort=tier_order,
-                            ),
-                            order=alt.Order(
-                                "subscriber_tier:N",
-                                sort="ascending",
+                                "entry_status:N",
+                                title="Entry Status",
+                                scale=alt.Scale(
+                                    domain=["New entry", "Carry-over"],
+                                    range=["#22c55e", "#6366f1"],
+                                ),
                             ),
                             tooltip=[
                                 alt.Tooltip("time_bucket:T", title="Time"),
-                                alt.Tooltip("subscriber_tier:N", title="Channel Size"),
+                                "entry_status",
                                 alt.Tooltip("videos:Q", title="Videos", format=","),
-                                alt.Tooltip("share:Q", title="Share", format=".1%"),
                             ],
                         )
-                        .properties(
-                            height=300,
-                            title="Diagnostic 4: Channel Size Mix Shift",
-                        )
+                        .properties(height=320)
                     )
-                    st.altair_chart(channel_mix_chart, width="stretch")
-                    _explanation(_explain_channel_mix_shift(channel_mix_df))
+                    st.altair_chart(new_carry_chart, width="stretch")
+                    _explanation(_explain_views_new_vs_carryover(new_carryover_df))
 
     # st.subheader("Category Share of Total Views Over Time")
     # st.markdown("Analytical question: How is category dominance changing over time?")
@@ -1663,183 +1525,111 @@ with tab1:
         selected_duration_bucket = _normalize_context_value(duration_context.get("duration_bucket"))
 
         if selected_duration_category or selected_duration_bucket:
-            diagnostic_region = None if selected_region == "All" else selected_region
-            duration_diag_df = load_duration_engagement_diagnostic(
+            diagnostic_region_local = None if selected_region == "All" else selected_region
+            slot_footprint_df = load_duration_slot_footprint_diagnostic(
                 str(selected_duration_category) if selected_duration_category else None,
-                diagnostic_region,
+                diagnostic_region_local,
+                history_window,
+            )
+            audience_response_df = load_duration_audience_response_diagnostic(
+                str(selected_duration_category) if selected_duration_category else None,
+                diagnostic_region_local,
                 history_window,
             )
 
             st.markdown(
-                "**Diagnostic 3: Duration Bucket vs Engagement**"
-                + (
-                    f" for `{selected_duration_category}`"
-                    if selected_duration_category
-                    else ""
-                )
+                "**Why does this duration distribution look the way it does?**"
+                + (f" for `{selected_duration_category}`" if selected_duration_category else "")
             )
 
-            if duration_diag_df.empty:
-                st.info("No duration diagnostic data available for this selection.")
-            else:
-                if selected_duration_bucket:
-                    duration_diag_df["is_selected"] = (
-                        duration_diag_df["duration_bucket"] == selected_duration_bucket
-                    )
+            dur_col1, dur_col2 = st.columns(2)
+
+            with dur_col1:
+                st.markdown("**Diagnostic A: Slot Footprint Decomposition**")
+                st.caption("Slot footprint = distinct videos × avg batches each persists. Reveals whether bucket dominance is volume-led or persistence-led.")
+                if slot_footprint_df.empty:
+                    st.info("Not enough data for this selection.")
                 else:
-                    duration_diag_df["is_selected"] = False
-
-                duration_diag_chart = (
-                    alt.Chart(duration_diag_df)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("duration_bucket:N", title="Duration Bucket"),
-                        y=alt.Y("avg_engagement_rate:Q", title="Average Engagement Rate"),
-                        color=alt.condition(
-                            alt.datum.is_selected,
-                            alt.value("#f59e0b"),
-                            alt.value("#38bdf8"),
-                        ),
-                        tooltip=[
-                            "duration_bucket",
-                            alt.Tooltip(
-                                "avg_engagement_rate:Q",
-                                title="Avg Engagement Rate",
-                                format=".2%",
-                            ),
-                            alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                            alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                        ],
+                    # Two-panel grouped chart: one bar per (duration_bucket, lever).
+                    melted = slot_footprint_df.melt(
+                        id_vars=["duration_bucket"],
+                        value_vars=["distinct_videos", "avg_batches_per_video"],
+                        var_name="lever",
+                        value_name="value",
                     )
-                    .properties(height=320)
-                )
-                st.altair_chart(duration_diag_chart, width="stretch")
-                _explanation(_explain_duration_engagement(duration_diag_df))
-
-            duration_velocity_df = load_duration_velocity_diagnostic(
-                str(selected_duration_category) if selected_duration_category else None,
-                diagnostic_region,
-                history_window,
-            )
-            duration_overindex_df = load_duration_category_overindex_diagnostic(
-                diagnostic_region,
-                history_window,
-            )
-            duration_region_df = load_duration_region_diagnostic(
-                str(selected_duration_category) if selected_duration_category else None,
-                history_window,
-            )
-
-            dur_diag_col1, dur_diag_col2 = st.columns(2)
-
-            with dur_diag_col1:
-                st.markdown("**Diagnostic 4: Velocity by Duration Bucket**")
-                if duration_velocity_df.empty:
-                    st.info("No velocity-by-duration data available for this selection.")
-                else:
+                    melted["lever"] = melted["lever"].map({
+                        "distinct_videos": "Distinct videos (volume)",
+                        "avg_batches_per_video": "Avg batches each (persistence)",
+                    })
                     if selected_duration_bucket:
-                        duration_velocity_df["is_selected"] = (
-                            duration_velocity_df["duration_bucket"] == selected_duration_bucket
-                        )
+                        melted["is_selected"] = melted["duration_bucket"] == selected_duration_bucket
                     else:
-                        duration_velocity_df["is_selected"] = False
-
-                    velocity_by_duration_chart = (
-                        alt.Chart(duration_velocity_df)
+                        melted["is_selected"] = False
+                    slot_chart = (
+                        alt.Chart(melted)
                         .mark_bar()
                         .encode(
                             x=alt.X("duration_bucket:N", title="Duration Bucket"),
-                            y=alt.Y("avg_velocity:Q", title="Average Velocity"),
-                            color=alt.condition(
+                            y=alt.Y("value:Q", title="Value"),
+                            color=alt.Color("lever:N", title="Lever"),
+                            column=alt.Column(
+                                "lever:N",
+                                title=None,
+                                header=alt.Header(labelFontWeight="bold"),
+                            ),
+                            opacity=alt.condition(
                                 alt.datum.is_selected,
-                                alt.value("#f59e0b"),
-                                alt.value("#22c55e"),
+                                alt.value(1.0),
+                                alt.value(0.55),
                             ),
                             tooltip=[
                                 "duration_bucket",
-                                alt.Tooltip("avg_velocity:Q", title="Avg Velocity", format=",.2f"),
-                                alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                                alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
+                                "lever",
+                                alt.Tooltip("value:Q", title="Value", format=",.2f"),
                             ],
                         )
-                        .properties(height=320)
+                        .properties(width=180, height=280)
+                        .resolve_scale(y="independent")
                     )
-                    st.altair_chart(velocity_by_duration_chart, width="stretch")
-                    _explanation(_explain_duration_velocity(duration_velocity_df))
+                    st.altair_chart(slot_chart, width="stretch")
+                    _explanation(_explain_duration_slot_footprint(slot_footprint_df))
 
-            with dur_diag_col2:
-                st.markdown("**Diagnostic 6: Duration x Region Engagement**")
-                if duration_region_df.empty:
-                    st.info("No duration-by-region data available for this selection.")
+            with dur_col2:
+                st.markdown("**Diagnostic B: Audience Response per Bucket**")
+                st.caption("Avg engagement rate × avg views per video. Reveals whether bucket dominance reflects audience preference or just publishing volume.")
+                if audience_response_df.empty:
+                    st.info("Not enough data for this selection.")
                 else:
-                    duration_region_heatmap = (
-                        alt.Chart(duration_region_df)
-                        .mark_rect()
-                        .encode(
-                            x=alt.X("trending_region:N", title="Region"),
-                            y=alt.Y("duration_bucket:N", title="Duration Bucket"),
-                            color=alt.Color(
-                                "avg_engagement_rate:Q",
-                                title="Avg Engagement Rate",
-                                scale=alt.Scale(scheme="blues"),
-                            ),
-                            tooltip=[
-                                "trending_region",
-                                "duration_bucket",
-                                alt.Tooltip(
-                                    "avg_engagement_rate:Q",
-                                    title="Avg Engagement Rate",
-                                    format=".2%",
-                                ),
-                                alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                                alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                            ],
-                        )
-                        .properties(height=320)
-                    )
-                    st.altair_chart(duration_region_heatmap, width="stretch")
-                    _explanation(_explain_duration_region(duration_region_df))
-
-            st.markdown("**Diagnostic 5: Category Over-Indexing per Duration Bucket**")
-            st.caption(
-                "Lift > 1 (warmer color) means a category is over-represented in that "
-                "duration bucket relative to its overall share of trending videos."
-            )
-            if duration_overindex_df.empty:
-                st.info("No over-indexing data available for this selection.")
-            else:
-                # Replace nulls in lift so Altair can render them.
-                duration_overindex_df = duration_overindex_df.copy()
-                duration_overindex_df["lift"] = duration_overindex_df["lift"].fillna(0)
-
-                overindex_heatmap = (
-                    alt.Chart(duration_overindex_df)
-                    .mark_rect()
-                    .encode(
+                    ar_base = alt.Chart(audience_response_df).encode(
                         x=alt.X("duration_bucket:N", title="Duration Bucket"),
+                    )
+                    er_bars = ar_base.mark_bar(color="#a855f7").encode(
                         y=alt.Y(
-                            "category_name:N",
-                            title="Category",
-                            sort="-x",
-                        ),
-                        color=alt.Color(
-                            "lift:Q",
-                            title="Lift (bucket / overall)",
-                            scale=alt.Scale(scheme="redyellowblue", domainMid=1, reverse=True),
+                            "avg_engagement_rate:Q",
+                            title="Avg Engagement Rate",
+                            axis=alt.Axis(format=".1%", titleColor="#a855f7"),
                         ),
                         tooltip=[
                             "duration_bucket",
-                            "category_name",
-                            alt.Tooltip("videos_in_bucket_cat:Q", title="Videos", format=","),
-                            alt.Tooltip("bucket_share:Q", title="Bucket Share", format=".1%"),
-                            alt.Tooltip("overall_share:Q", title="Overall Share", format=".1%"),
-                            alt.Tooltip("lift:Q", title="Lift", format=".2f"),
+                            alt.Tooltip("avg_engagement_rate:Q", title="Avg Engagement Rate", format=".2%"),
+                            alt.Tooltip("avg_views_per_video:Q", title="Avg Views/Video", format=","),
+                            alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
                         ],
                     )
-                    .properties(height=320)
-                )
-                st.altair_chart(overindex_heatmap, width="stretch")
-                _explanation(_explain_duration_overindex(duration_overindex_df))
+                    views_line = ar_base.mark_line(color="#f59e0b", point=True).encode(
+                        y=alt.Y(
+                            "avg_views_per_video:Q",
+                            title="Avg Views per Video",
+                            axis=alt.Axis(format="~s", titleColor="#f59e0b"),
+                        ),
+                    )
+                    st.altair_chart(
+                        alt.layer(er_bars, views_line)
+                        .resolve_scale(y="independent")
+                        .properties(height=320),
+                        width="stretch",
+                    )
+                    _explanation(_explain_duration_audience_response(audience_response_df))
 
     st.subheader("Channel Subscriber Size Distribution")
     st.markdown("Analytical question: Are trending videos dominated by mega channels or smaller creators?")
@@ -1890,25 +1680,17 @@ with tab1:
         selected_subscriber_region = _normalize_context_value(subscriber_context.get("trending_region"))
 
         if selected_subscriber_tier or selected_subscriber_region:
-            # Region scope: clicked region wins; otherwise fall back to the
-            # global region filter from the sidebar.
             if selected_subscriber_region:
-                diagnostic_region = str(selected_subscriber_region)
+                diag_region_local = str(selected_subscriber_region)
             else:
-                diagnostic_region = None if selected_region == "All" else selected_region
-            diagnostic_category = None  # subscriber-tier section is category-agnostic
+                diag_region_local = None if selected_region == "All" else selected_region
+            diag_category_local = None  # subscriber-tier section is category-agnostic
 
-            subscriber_views_df = load_subscriber_views_diagnostic(
-                diagnostic_category, diagnostic_region, history_window
+            tier_effort_df = load_tier_effort_reward_diagnostic(
+                diag_category_local, diag_region_local, history_window,
             )
-            subscriber_engagement_df = load_subscriber_engagement_diagnostic(
-                diagnostic_category, diagnostic_region, history_window
-            )
-            subscriber_persistence_df = load_subscriber_persistence_diagnostic(
-                diagnostic_category, diagnostic_region, history_window
-            )
-            subscriber_region_df = load_subscriber_region_diagnostic(
-                diagnostic_category, history_window
+            tier_persistence_df = load_tier_persistence_engagement_diagnostic(
+                diag_category_local, diag_region_local, history_window,
             )
 
             scope_bits = []
@@ -1917,189 +1699,94 @@ with tab1:
             if selected_subscriber_region:
                 scope_bits.append(f"region `{selected_subscriber_region}`")
             st.markdown(
-                "**Subscriber-tier diagnostics" + (
-                    f" for {' in '.join(scope_bits)}**"
-                    if scope_bits
-                    else "**"
+                "**Why does this tier mix look the way it does?**" + (
+                    f" — {' in '.join(scope_bits)}" if scope_bits else ""
                 )
             )
 
-            tier_order = [
-                "Small (<100K)",
-                "Mid (100K-1M)",
-                "Large (1M-10M)",
-                "Mega (10M+)",
-            ]
+            tier_order = ["Small (<100K)", "Mid (100K-1M)", "Large (1M-10M)", "Mega (10M+)"]
 
             sub_col1, sub_col2 = st.columns(2)
 
             with sub_col1:
-                st.markdown("**Diagnostic 1: Avg Views by Subscriber Tier**")
-                if subscriber_views_df.empty:
-                    st.info("No avg-views data available for this selection.")
+                st.markdown("**Diagnostic A: Effort vs Reward per Tier**")
+                st.caption("Distinct channels × avg trending slots per channel. Decomposes broad participation vs concentrated dominance.")
+                if tier_effort_df.empty:
+                    st.info("Not enough data for this selection.")
                 else:
-                    df_views = subscriber_views_df.copy()
-                    df_views["is_selected"] = (
-                        df_views["subscriber_tier"] == selected_subscriber_tier
-                        if selected_subscriber_tier
-                        else False
+                    melted = tier_effort_df.melt(
+                        id_vars=["subscriber_tier"],
+                        value_vars=["distinct_channels", "avg_slots_per_channel"],
+                        var_name="lever",
+                        value_name="value",
                     )
-                    views_chart = (
-                        alt.Chart(df_views)
+                    melted["lever"] = melted["lever"].map({
+                        "distinct_channels": "Distinct channels (participation)",
+                        "avg_slots_per_channel": "Avg slots/channel (intensity)",
+                    })
+                    if selected_subscriber_tier:
+                        melted["is_selected"] = melted["subscriber_tier"] == selected_subscriber_tier
+                    else:
+                        melted["is_selected"] = False
+                    effort_chart = (
+                        alt.Chart(melted)
                         .mark_bar()
                         .encode(
-                            x=alt.X(
-                                "subscriber_tier:N",
-                                sort=tier_order,
-                                title="Subscriber Tier",
-                            ),
-                            y=alt.Y(
-                                "avg_views:Q",
-                                title="Avg Views per Video",
-                                axis=alt.Axis(format="~s"),
-                            ),
-                            color=alt.condition(
-                                alt.datum.is_selected,
-                                alt.value("#f97316"),
-                                alt.value("#0ea5e9"),
+                            x=alt.X("subscriber_tier:N", sort=tier_order, title="Subscriber Tier"),
+                            y=alt.Y("value:Q", title="Value"),
+                            color=alt.Color("lever:N", title="Lever"),
+                            column=alt.Column("lever:N", title=None),
+                            opacity=alt.condition(
+                                alt.datum.is_selected, alt.value(1.0), alt.value(0.55)
                             ),
                             tooltip=[
                                 "subscriber_tier",
-                                alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                                alt.Tooltip("avg_likes:Q", title="Avg Likes", format=","),
-                                alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
+                                "lever",
+                                alt.Tooltip("value:Q", title="Value", format=",.2f"),
                             ],
                         )
-                        .properties(height=320)
+                        .properties(width=160, height=280)
+                        .resolve_scale(y="independent")
                     )
-                    st.altair_chart(views_chart, width="stretch")
-                    _explanation(_explain_subscriber_views(df_views))
+                    st.altair_chart(effort_chart, width="stretch")
+                    _explanation(_explain_tier_effort_reward(tier_effort_df))
 
             with sub_col2:
-                st.markdown("**Diagnostic 2: Avg Engagement by Subscriber Tier**")
-                if subscriber_engagement_df.empty:
-                    st.info("No engagement data available for this selection.")
+                st.markdown("**Diagnostic B: Persistence × Engagement per Tier**")
+                st.caption("Avg batches each video persists × avg engagement rate. Decomposes whether a tier holds slots through stickiness or audience response.")
+                if tier_persistence_df.empty:
+                    st.info("Not enough data for this selection.")
                 else:
-                    df_eng = subscriber_engagement_df.copy()
-                    df_eng["is_selected"] = (
-                        df_eng["subscriber_tier"] == selected_subscriber_tier
-                        if selected_subscriber_tier
-                        else False
+                    pe_base = alt.Chart(tier_persistence_df).encode(
+                        x=alt.X("subscriber_tier:N", sort=tier_order, title="Subscriber Tier"),
                     )
-                    eng_chart = (
-                        alt.Chart(df_eng)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X(
-                                "subscriber_tier:N",
-                                sort=tier_order,
-                                title="Subscriber Tier",
-                            ),
-                            y=alt.Y(
-                                "avg_engagement_rate:Q",
-                                title="Avg Engagement Rate",
-                                axis=alt.Axis(format=".1%"),
-                            ),
-                            color=alt.condition(
-                                alt.datum.is_selected,
-                                alt.value("#f97316"),
-                                alt.value("#a855f7"),
-                            ),
-                            tooltip=[
-                                "subscriber_tier",
-                                alt.Tooltip(
-                                    "avg_engagement_rate:Q",
-                                    title="Avg Engagement Rate",
-                                    format=".2%",
-                                ),
-                                alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                                alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                            ],
-                        )
-                        .properties(height=320)
+                    persistence_bars = pe_base.mark_bar(color="#22c55e").encode(
+                        y=alt.Y(
+                            "avg_batches_per_video:Q",
+                            title="Avg Batches per Video",
+                            axis=alt.Axis(titleColor="#22c55e"),
+                        ),
+                        tooltip=[
+                            "subscriber_tier",
+                            alt.Tooltip("avg_batches_per_video:Q", title="Avg Batches", format=".2f"),
+                            alt.Tooltip("avg_engagement_rate:Q", title="Avg ER", format=".2%"),
+                            alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
+                        ],
                     )
-                    st.altair_chart(eng_chart, width="stretch")
-                    _explanation(_explain_subscriber_engagement(df_eng))
-
-            sub_col3, sub_col4 = st.columns(2)
-
-            with sub_col3:
-                st.markdown("**Diagnostic 3: Persistence by Subscriber Tier**")
-                st.caption("Avg distinct collection batches each tier's videos appear in trending.")
-                if subscriber_persistence_df.empty:
-                    st.info("No persistence data available for this selection.")
-                else:
-                    df_pers = subscriber_persistence_df.copy()
-                    df_pers["is_selected"] = (
-                        df_pers["subscriber_tier"] == selected_subscriber_tier
-                        if selected_subscriber_tier
-                        else False
+                    er_line = pe_base.mark_line(color="#a855f7", point=True).encode(
+                        y=alt.Y(
+                            "avg_engagement_rate:Q",
+                            title="Avg Engagement Rate",
+                            axis=alt.Axis(format=".1%", titleColor="#a855f7"),
+                        ),
                     )
-                    persistence_chart = (
-                        alt.Chart(df_pers)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X(
-                                "subscriber_tier:N",
-                                sort=tier_order,
-                                title="Subscriber Tier",
-                            ),
-                            y=alt.Y("avg_batches:Q", title="Avg Batches Persisted"),
-                            color=alt.condition(
-                                alt.datum.is_selected,
-                                alt.value("#f97316"),
-                                alt.value("#22c55e"),
-                            ),
-                            tooltip=[
-                                "subscriber_tier",
-                                alt.Tooltip("avg_batches:Q", title="Avg Batches", format=".2f"),
-                                alt.Tooltip(
-                                    "median_batches:Q",
-                                    title="Median Batches",
-                                    format=".0f",
-                                ),
-                                alt.Tooltip("avg_peak_views:Q", title="Avg Peak Views", format=","),
-                                alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                            ],
-                        )
-                        .properties(height=320)
+                    st.altair_chart(
+                        alt.layer(persistence_bars, er_line)
+                        .resolve_scale(y="independent")
+                        .properties(height=320),
+                        width="stretch",
                     )
-                    st.altair_chart(persistence_chart, width="stretch")
-                    _explanation(_explain_subscriber_persistence(df_pers))
-
-            with sub_col4:
-                st.markdown("**Diagnostic 4: Region-Specific Creator-Size Dependence**")
-                st.caption("Share of trending videos by tier within each region.")
-                if subscriber_region_df.empty:
-                    st.info("No region/tier data available for this selection.")
-                else:
-                    region_tier_chart = (
-                        alt.Chart(subscriber_region_df)
-                        .mark_rect()
-                        .encode(
-                            x=alt.X("trending_region:N", title="Region"),
-                            y=alt.Y(
-                                "subscriber_tier:N",
-                                sort=tier_order,
-                                title="Subscriber Tier",
-                            ),
-                            color=alt.Color(
-                                "tier_share:Q",
-                                title="Share of Region",
-                                scale=alt.Scale(scheme="purples"),
-                            ),
-                            tooltip=[
-                                "trending_region",
-                                "subscriber_tier",
-                                alt.Tooltip("videos:Q", title="Videos", format=","),
-                                alt.Tooltip("region_total:Q", title="Region Total", format=","),
-                                alt.Tooltip("tier_share:Q", title="Share", format=".1%"),
-                            ],
-                        )
-                        .properties(height=320)
-                    )
-                    st.altair_chart(region_tier_chart, width="stretch")
-                    _explanation(_explain_subscriber_region(subscriber_region_df))
+                    _explanation(_explain_tier_persistence_engagement(tier_persistence_df))
 
     st.subheader("Top Tag Usage Frequency")
     st.markdown("Analytical question: Which tags appear most often in trending videos?")
@@ -2147,216 +1834,91 @@ with tab1:
         selected_tag_category = _normalize_context_value(tag_context.get("category_name"))
 
         if selected_tag or selected_tag_category:
-            diagnostic_region = None if selected_region == "All" else selected_region
-            tag_diag_df = load_tag_effectiveness_diagnostic(
+            diag_region_local = None if selected_region == "All" else selected_region
+            tag_adoption_df = load_tag_adoption_intensity_diagnostic(
                 str(selected_tag_category) if selected_tag_category else None,
-                diagnostic_region,
-                history_window,
+                diag_region_local, history_window,
+            )
+            tag_cooccur_df = load_tag_cooccurrence_diagnostic(
+                str(selected_tag_category) if selected_tag_category else None,
+                diag_region_local, history_window,
             )
 
             st.markdown(
-                "**Diagnostic 4: Tag Frequency vs Engagement**"
+                "**Why are these tags dominating?**"
                 + (f" for `{selected_tag_category}`" if selected_tag_category else "")
             )
 
-            if tag_diag_df.empty:
-                st.info("No tag diagnostic data available for this selection.")
-            else:
-                if selected_tag:
-                    tag_diag_df["is_selected"] = tag_diag_df["tag"] == selected_tag
-                else:
-                    tag_diag_df["is_selected"] = False
+            tag_col1, tag_col2 = st.columns(2)
 
-                tag_diag_chart = (
-                    alt.Chart(tag_diag_df)
-                    .mark_circle(opacity=0.8)
-                    .encode(
-                        x=alt.X("videos_using_tag:Q", title="Videos Using Tag"),
-                        y=alt.Y("avg_engagement_rate:Q", title="Average Engagement Rate"),
-                        size=alt.Size("avg_views:Q", title="Average Views"),
-                        color=alt.condition(
-                            alt.datum.is_selected,
-                            alt.value("#f97316"),
-                            alt.value("#6366f1"),
-                        ),
-                        tooltip=[
-                            "tag",
-                            alt.Tooltip("videos_using_tag:Q", title="Videos Using Tag", format=","),
-                            alt.Tooltip(
-                                "avg_engagement_rate:Q",
-                                title="Avg Engagement Rate",
-                                format=".2%",
-                            ),
-                            alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                        ],
-                    )
-                    .properties(height=360)
-                )
-                st.altair_chart(tag_diag_chart, width="stretch")
-                _explanation(_explain_tag_frequency_engagement(tag_diag_df))
-
-            high_er_tags_df = load_high_engagement_tags_diagnostic(
-                str(selected_tag_category) if selected_tag_category else None,
-                diagnostic_region,
-                history_window,
-            )
-            tag_region_df = load_tag_region_concentration_diagnostic(
-                str(selected_tag_category) if selected_tag_category else None,
-                history_window,
-            )
-            tag_density_df = load_tag_density_performance_diagnostic(
-                str(selected_tag_category) if selected_tag_category else None,
-                diagnostic_region,
-                history_window,
-            )
-
-            tag_diag_col1, tag_diag_col2 = st.columns(2)
-
-            with tag_diag_col1:
-                st.markdown("**Diagnostic 5: Highest-Engagement Tags**")
-                st.caption("Tags ranked by avg engagement rate (min 5 videos so single-use noise is filtered).")
-                if high_er_tags_df.empty:
-                    st.info("No high-engagement tag data available for this selection.")
+            with tag_col1:
+                st.markdown("**Diagnostic A: Channel Adoption vs Per-Channel Intensity**")
+                st.caption("For top tags: distinct channels using × avg videos per channel. Decomposes whether a tag is broadly adopted or flooded by a few creators.")
+                if tag_adoption_df.empty:
+                    st.info("Not enough tag data in scope.")
                 else:
                     if selected_tag:
-                        high_er_tags_df = high_er_tags_df.copy()
-                        high_er_tags_df["is_selected"] = high_er_tags_df["tag"] == selected_tag
+                        tag_adoption_df = tag_adoption_df.copy()
+                        tag_adoption_df["is_selected"] = tag_adoption_df["tag"] == selected_tag
                     else:
-                        high_er_tags_df = high_er_tags_df.copy()
-                        high_er_tags_df["is_selected"] = False
-
-                    high_er_chart = (
-                        alt.Chart(high_er_tags_df)
-                        .mark_bar()
+                        tag_adoption_df = tag_adoption_df.copy()
+                        tag_adoption_df["is_selected"] = False
+                    adoption_chart = (
+                        alt.Chart(tag_adoption_df)
+                        .mark_circle(opacity=0.8)
                         .encode(
                             x=alt.X(
-                                "avg_engagement_rate:Q",
-                                title="Avg Engagement Rate",
-                                axis=alt.Axis(format=".1%"),
+                                "distinct_channels:Q",
+                                title="Distinct Channels Using Tag (adoption)",
                             ),
-                            y=alt.Y("tag:N", sort="-x", title="Tag"),
+                            y=alt.Y(
+                                "videos_per_channel:Q",
+                                title="Videos per Channel (intensity)",
+                            ),
+                            size=alt.Size(
+                                "videos_using_tag:Q",
+                                title="Videos Using Tag",
+                            ),
                             color=alt.condition(
                                 alt.datum.is_selected,
                                 alt.value("#f97316"),
-                                alt.value("#10b981"),
+                                alt.value("#0ea5e9"),
                             ),
                             tooltip=[
                                 "tag",
-                                alt.Tooltip(
-                                    "avg_engagement_rate:Q",
-                                    title="Avg Engagement Rate",
-                                    format=".2%",
-                                ),
-                                alt.Tooltip(
-                                    "videos_using_tag:Q",
-                                    title="Videos Using Tag",
-                                    format=",",
-                                ),
-                                alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
+                                alt.Tooltip("videos_using_tag:Q", title="Total Videos", format=","),
+                                alt.Tooltip("distinct_channels:Q", title="Channels", format=","),
+                                alt.Tooltip("videos_per_channel:Q", title="Videos/Channel", format=".2f"),
                             ],
                         )
                         .properties(height=360)
                     )
-                    st.altair_chart(high_er_chart, width="stretch")
-                    _explanation(_explain_high_engagement_tags(high_er_tags_df))
+                    st.altair_chart(adoption_chart, width="stretch")
+                    _explanation(_explain_tag_adoption_intensity(tag_adoption_df))
 
-            with tag_diag_col2:
-                st.markdown("**Diagnostic 7: Tag-Heavy vs Tag-Light Performance**")
-                st.caption("Bucketed by tag count per video — does adding more tags actually help?")
-                if tag_density_df.empty:
-                    st.info("No tag density data available for this selection.")
+            with tag_col2:
+                st.markdown("**Diagnostic B: Co-occurrence with the Top Tag**")
+                st.caption("Other tags that appear alongside the most-used tag. Reveals whether the dominance is part of a multi-tag template.")
+                if tag_cooccur_df.empty:
+                    st.info("Not enough data to compute co-occurrence.")
                 else:
-                    density_order = [
-                        "0 tags",
-                        "1-5 tags",
-                        "6-10 tags",
-                        "11-20 tags",
-                        "21+ tags",
-                    ]
-                    density_base = alt.Chart(tag_density_df).encode(
-                        x=alt.X(
-                            "tag_density_bucket:N",
-                            sort=density_order,
-                            title="Tag Density Bucket",
-                        ),
+                    cooccur_chart = (
+                        alt.Chart(tag_cooccur_df)
+                        .mark_bar(color="#a855f7")
+                        .encode(
+                            x=alt.X("co_share:Q", title="Co-occurrence Share", axis=alt.Axis(format=".0%")),
+                            y=alt.Y("tag:N", sort="-x", title="Co-occurring Tag"),
+                            tooltip=[
+                                "tag",
+                                "primary_tag",
+                                alt.Tooltip("co_videos:Q", title="Co-occurring Videos", format=","),
+                                alt.Tooltip("co_share:Q", title="Share", format=".1%"),
+                            ],
+                        )
+                        .properties(height=360)
                     )
-                    density_bars = density_base.mark_bar(color="#6366f1").encode(
-                        y=alt.Y(
-                            "avg_engagement_rate:Q",
-                            title="Avg Engagement Rate",
-                            axis=alt.Axis(format=".1%"),
-                        ),
-                        tooltip=[
-                            "tag_density_bucket",
-                            alt.Tooltip(
-                                "avg_engagement_rate:Q",
-                                title="Avg Engagement Rate",
-                                format=".2%",
-                            ),
-                            alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                            alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                        ],
-                    )
-                    density_views_line = density_base.mark_line(
-                        color="#f59e0b",
-                        point=True,
-                    ).encode(
-                        y=alt.Y(
-                            "avg_views:Q",
-                            title="Avg Views",
-                            axis=alt.Axis(format="~s", titleColor="#f59e0b"),
-                        ),
-                    )
-                    density_chart = alt.layer(
-                        density_bars, density_views_line
-                    ).resolve_scale(y="independent").properties(height=360)
-                    st.altair_chart(density_chart, width="stretch")
-                    _explanation(_explain_tag_density(tag_density_df))
-
-            st.markdown("**Diagnostic 6: Tag Region Concentration (Region-Specific vs Global)**")
-            st.caption(
-                "Each row is a top tag; bars show how its usage splits across regions. "
-                "Tags dominated by one region are region-specific; flat splits are global."
-            )
-            if tag_region_df.empty:
-                st.info("No region-concentration data available for this selection.")
-            else:
-                tag_region_chart = (
-                    alt.Chart(tag_region_df)
-                    .mark_bar()
-                    .encode(
-                        y=alt.Y(
-                            "tag:N",
-                            sort=alt.EncodingSortField(
-                                field="region_concentration",
-                                order="descending",
-                            ),
-                            title="Tag (sorted: most region-specific on top)",
-                        ),
-                        x=alt.X(
-                            "region_share:Q",
-                            stack="normalize",
-                            title="Share of Tag Usage by Region",
-                            axis=alt.Axis(format=".0%"),
-                        ),
-                        color=alt.Color("trending_region:N", title="Region"),
-                        tooltip=[
-                            "tag",
-                            "trending_region",
-                            alt.Tooltip("videos_in_region:Q", title="Videos in Region", format=","),
-                            alt.Tooltip("videos_total:Q", title="Total Videos", format=","),
-                            alt.Tooltip("region_share:Q", title="Region Share", format=".1%"),
-                            alt.Tooltip(
-                                "region_concentration:Q",
-                                title="Concentration (max share)",
-                                format=".1%",
-                            ),
-                        ],
-                    )
-                    .properties(height=420)
-                )
-                st.altair_chart(tag_region_chart, width="stretch")
-                _explanation(_explain_tag_region_concentration(tag_region_df))
+                    st.altair_chart(cooccur_chart, width="stretch")
+                    _explanation(_explain_tag_cooccurrence(tag_cooccur_df))
 
 
     st.subheader("Trending Rank Distribution by Category")
@@ -2408,211 +1970,78 @@ with tab1:
         selected_rank_region = _normalize_context_value(trending_rank_context.get("trending_region"))
 
         if selected_rank_category:
-            # Region scope: clicked region wins; otherwise fall back to the
-            # global region filter from the sidebar.
             if selected_rank_region:
                 rank_diag_region = str(selected_rank_region)
             else:
                 rank_diag_region = None if selected_region == "All" else selected_region
 
-            new_vs_persisting_df = load_rank_new_vs_persisting_diagnostic(
+            slot_turnover_df = load_rank_slot_turnover_diagnostic(
                 str(selected_rank_category), rank_diag_region, history_window
             )
-            channel_concentration_df = load_top_rank_channel_concentration_diagnostic(
-                str(selected_rank_category), rank_diag_region, history_window
-            )
-            velocity_rank_df = load_velocity_vs_rank_diagnostic(
-                str(selected_rank_category), rank_diag_region, history_window
-            )
-            share_drivers_df = load_category_share_drivers_diagnostic(
+            channel_concentration_df = load_rank_channel_concentration_v2_diagnostic(
                 str(selected_rank_category), rank_diag_region, history_window
             )
 
             scope_bits = [f"`{selected_rank_category}`"]
             if selected_rank_region:
                 scope_bits.append(f"region `{selected_rank_region}`")
-            st.markdown("**Trending-rank diagnostics for " + " in ".join(scope_bits) + "**")
+            st.markdown("**Why does this category hold this many slots?** — " + " in ".join(scope_bits))
 
             rank_col1, rank_col2 = st.columns(2)
 
             with rank_col1:
-                st.markdown("**Diagnostic 1: New Entries vs Persisting Videos**")
-                st.caption("Are trending slots filled by fresh videos, or the same ones holding on?")
-                if new_vs_persisting_df.empty:
-                    st.info("No new-vs-persisting data available for this selection.")
+                st.markdown("**Diagnostic A: Slot Turnover Rate**")
+                st.caption("Distinct videos / slot observations per region. High = vibrant pipeline; low = a few persistent videos hogging the category.")
+                if slot_turnover_df.empty:
+                    st.info("Not enough data for this selection.")
                 else:
-                    new_vs_persisting_chart = (
-                        alt.Chart(new_vs_persisting_df)
-                        .mark_bar()
+                    turnover_chart = (
+                        alt.Chart(slot_turnover_df)
+                        .mark_bar(color="#06b6d4")
                         .encode(
-                            x=alt.X("time_bucket:T", title="Time"),
-                            y=alt.Y(
-                                "videos:Q",
-                                title="Distinct Videos",
-                                stack="zero",
-                            ),
-                            color=alt.Color(
-                                "entry_status:N",
-                                title="Entry Status",
-                                scale=alt.Scale(
-                                    domain=["New entry", "Persisting"],
-                                    range=["#22c55e", "#6366f1"],
-                                ),
-                            ),
+                            x=alt.X("trending_region:N", title="Region"),
+                            y=alt.Y("turnover_rate:Q", title="Turnover Rate (distinct / slot obs.)"),
                             tooltip=[
-                                alt.Tooltip("time_bucket:T", title="Time"),
-                                "entry_status",
-                                alt.Tooltip("videos:Q", title="Videos", format=","),
+                                "trending_region",
+                                alt.Tooltip("distinct_videos:Q", title="Distinct Videos", format=","),
+                                alt.Tooltip("slot_observations:Q", title="Slot Observations", format=","),
+                                alt.Tooltip("turnover_rate:Q", title="Turnover", format=".2f"),
                             ],
                         )
                         .properties(height=320)
                     )
-                    st.altair_chart(new_vs_persisting_chart, width="stretch")
-                    _explanation(_explain_new_vs_persisting(new_vs_persisting_df))
+                    st.altair_chart(turnover_chart, width="stretch")
+                    _explanation(_explain_rank_slot_turnover(slot_turnover_df))
 
             with rank_col2:
-                st.markdown("**Diagnostic 2: Top-Rank Channel Concentration**")
-                st.caption("Top-10 trending slots held by each channel — flat = diverse, spiky = concentrated.")
+                st.markdown("**Diagnostic B: Channel Concentration (Herfindahl-style)**")
+                st.caption("Each channel's share of all category slot observations. Top-3 share signals concentrated dominance vs broad distribution.")
                 if channel_concentration_df.empty:
-                    st.info("No top-rank channel data available for this selection.")
+                    st.info("Not enough channel data for this selection.")
                 else:
-                    channel_concentration_chart = (
+                    concentration_chart = (
                         alt.Chart(channel_concentration_df)
                         .mark_bar(color="#f97316")
                         .encode(
-                            x=alt.X("top_rank_slots:Q", title="Top-Rank Slots Held"),
+                            x=alt.X("share_pct:Q", title="Share of Category Slots (%)"),
                             y=alt.Y("channel_title:N", sort="-x", title="Channel"),
                             tooltip=[
                                 "channel_title",
-                                alt.Tooltip("top_rank_slots:Q", title="Top-Rank Slots", format=","),
-                                alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                                alt.Tooltip("avg_rank:Q", title="Avg Rank", format=".1f"),
-                                alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
+                                alt.Tooltip("slot_observations:Q", title="Slot Observations", format=","),
+                                alt.Tooltip("share_pct:Q", title="Share (%)", format=".2f"),
                             ],
                         )
                         .properties(height=320)
                     )
-                    st.altair_chart(channel_concentration_chart, width="stretch")
-                    _explanation(_explain_top_rank_concentration(channel_concentration_df))
-
-            rank_col3, rank_col4 = st.columns(2)
-
-            with rank_col3:
-                st.markdown("**Diagnostic 3: Velocity vs Best Trending Rank**")
-                st.caption("Lower (better) rank toward the top. Downward-sloping cloud = velocity drives rank.")
-                if velocity_rank_df.empty:
-                    st.info("No velocity-vs-rank data available for this selection.")
-                else:
-                    velocity_rank_chart = (
-                        alt.Chart(velocity_rank_df)
-                        .mark_circle(opacity=0.7)
-                        .encode(
-                            x=alt.X("avg_velocity:Q", title="Avg Velocity"),
-                            y=alt.Y(
-                                "best_rank:Q",
-                                title="Best Trending Rank (lower = better)",
-                                scale=alt.Scale(reverse=True),
-                            ),
-                            size=alt.Size("avg_views:Q", title="Avg Views"),
-                            color=alt.Color(
-                                "avg_engagement_rate:Q",
-                                title="Avg Engagement Rate",
-                                scale=alt.Scale(scheme="viridis"),
-                            ),
-                            tooltip=[
-                                "video_id",
-                                "channel_title",
-                                alt.Tooltip("avg_velocity:Q", title="Avg Velocity", format=",.2f"),
-                                alt.Tooltip("best_rank:Q", title="Best Rank", format=".0f"),
-                                alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                                alt.Tooltip(
-                                    "avg_engagement_rate:Q",
-                                    title="Avg Engagement Rate",
-                                    format=".2%",
-                                ),
-                            ],
-                        )
-                        .properties(height=320)
-                    )
-                    st.altair_chart(velocity_rank_chart, width="stretch")
-                    _explanation(_explain_velocity_vs_rank(velocity_rank_df))
-
-            with rank_col4:
-                st.markdown("**Diagnostic 4: Category Share Drivers — Volume vs Per-Video Strength**")
-                st.caption("Are more videos showing up, or are the same number of videos getting bigger?")
-                if share_drivers_df.empty:
-                    st.info("No share-drivers data available for this selection.")
-                else:
-                    share_base = alt.Chart(share_drivers_df).encode(
-                        x=alt.X("time_bucket:T", title="Time"),
-                    )
-                    share_videos_bars = share_base.mark_bar(color="#0ea5e9", opacity=0.7).encode(
-                        y=alt.Y(
-                            "unique_videos:Q",
-                            title="Unique Videos",
-                            axis=alt.Axis(titleColor="#0ea5e9"),
-                        ),
-                        tooltip=[
-                            alt.Tooltip("time_bucket:T", title="Time"),
-                            alt.Tooltip("unique_videos:Q", title="Unique Videos", format=","),
-                            alt.Tooltip("avg_views_per_video:Q", title="Avg Views/Video", format=","),
-                            alt.Tooltip("total_views:Q", title="Total Views", format=","),
-                        ],
-                    )
-                    share_avg_line = share_base.mark_line(
-                        color="#f59e0b", point=True
-                    ).encode(
-                        y=alt.Y(
-                            "avg_views_per_video:Q",
-                            title="Avg Views per Video",
-                            axis=alt.Axis(format="~s", titleColor="#f59e0b"),
-                        ),
-                    )
-                    share_drivers_chart = alt.layer(
-                        share_videos_bars, share_avg_line
-                    ).resolve_scale(y="independent").properties(height=320)
-                    st.altair_chart(share_drivers_chart, width="stretch")
-                    _explanation(_explain_share_drivers(share_drivers_df))
+                    st.altair_chart(concentration_chart, width="stretch")
+                    _explanation(_explain_rank_channel_concentration_v2(channel_concentration_df))
 
 
 
 
 with tab2:
     st.subheader("2. What will happen?")
-    st.markdown("Predictive analytics estimates which videos are most likely to keep trending, how their views may evolve, how long they may remain visible, and how category share may shift next.")
-
-    st.subheader("Trending Entry Probability Model")
-    st.markdown("Mode 3 training with latest-snapshot inference. This scores the current batch using next-batch survival as a practical probability proxy.")
-
-    if entry_probability_df.empty:
-        st.info("Not enough historical batches yet to score next-batch trending probability.")
-    else:
-        entry_chart = (
-            alt.Chart(entry_probability_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("predicted_probability:Q", title="Predicted Next-Batch Probability"),
-                y=alt.Y("title:N", sort="-x", title="Video"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "title",
-                    "channel_title",
-                    "category_name",
-                    "trending_region",
-                    "trending_rank",
-                    "view_count",
-                    "velocity",
-                    alt.Tooltip("engagement_rate:Q", title="Engagement Rate", format=".2%"),
-                    alt.Tooltip("predicted_probability:Q", title="Probability", format=".2%"),
-                ],
-            )
-            .properties(height=500)
-        )
-        st.altair_chart(entry_chart, width="stretch")
-        _model_metrics_strip(
-            "Trending Entry Probability",
-            load_entry_probability_metrics(df),
-        )
+    st.markdown("Predictive analytics estimates how current videos and categories may evolve next. Click a prediction chart to see action suggestions directly underneath it.")
 
     st.subheader("View Count Forecasting")
     st.markdown("Mode 3 per-video forecasting. The graph projects future view counts for currently trending videos with a simple confidence band.")
@@ -2620,6 +2049,13 @@ with tab2:
     if video_forecast_df.empty:
         st.info("View forecasting needs at least 4 observations for a currently trending video.")
     else:
+        forecast_select = alt.selection_point(
+            name="view_forecast_select",
+            fields=["title"],
+            on="click",
+            toggle=False,
+            empty=False,
+        )
         actual_line = (
             alt.Chart(video_forecast_df[video_forecast_df["series"] == "Actual"])
             .mark_line(point=True)
@@ -2627,6 +2063,7 @@ with tab2:
                 x=alt.X("time_bucket:T", title="Time"),
                 y=alt.Y("forecast_views:Q", title="View Count"),
                 color=alt.Color("title:N", title="Video"),
+                opacity=alt.condition(forecast_select, alt.value(1), alt.value(0.35)),
                 tooltip=[
                     "title",
                     "category_name",
@@ -2644,6 +2081,7 @@ with tab2:
                 x=alt.X("time_bucket:T", title="Time"),
                 y=alt.Y("forecast_views:Q", title="Forecast Views"),
                 color=alt.Color("title:N", legend=None),
+                opacity=alt.condition(forecast_select, alt.value(1), alt.value(0.35)),
                 tooltip=[
                     "title",
                     "category_name",
@@ -2666,11 +2104,36 @@ with tab2:
                 color=alt.Color("title:N", legend=None),
             )
         )
-        st.altair_chart((confidence_band + actual_line + forecast_line).properties(height=450), width="stretch")
+        forecast_chart = (
+            (confidence_band + actual_line + forecast_line)
+            .add_params(forecast_select)
+            .properties(height=450)
+        )
+        forecast_event = st.altair_chart(
+            forecast_chart,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="view_forecast_select",
+            key="view_forecast_chart",
+        )
         _model_metrics_strip(
             "View Count Forecast",
             load_view_forecast_metrics(df),
         )
+        forecast_context = _extract_chart_selection(
+            forecast_event,
+            "view_forecast_select",
+            ["title"],
+        )
+        selected_forecast_title = _normalize_context_value(forecast_context.get("title"))
+        if selected_forecast_title:
+            selected_forecast_rows = video_forecast_df[
+                video_forecast_df["title"] == selected_forecast_title
+            ].copy()
+            _render_suggestion_box(
+                f"Suggestions for `{selected_forecast_title}`",
+                _suggest_from_view_forecast(selected_forecast_rows),
+            )
 
     st.subheader("Trending Duration Prediction")
     st.markdown("Historical episodes are used to estimate total trending lifespan and remaining time for the videos in the current batch.")
@@ -2678,6 +2141,13 @@ with tab2:
     if duration_prediction_df.empty:
         st.info("Trending duration prediction needs more accumulated history before it becomes stable.")
     else:
+        duration_select = alt.selection_point(
+            name="duration_prediction_select",
+            fields=["title"],
+            on="click",
+            toggle=False,
+            empty=False,
+        )
         duration_prediction_chart = (
             alt.Chart(duration_prediction_df)
             .mark_bar()
@@ -2685,6 +2155,7 @@ with tab2:
                 x=alt.X("predicted_remaining_hours:Q", title="Predicted Remaining Hours"),
                 y=alt.Y("title:N", sort="-x", title="Video"),
                 color=alt.Color("category_name:N", title="Category"),
+                opacity=alt.condition(duration_select, alt.value(1), alt.value(0.4)),
                 tooltip=[
                     "title",
                     "channel_title",
@@ -2696,13 +2167,34 @@ with tab2:
                     alt.Tooltip("predicted_remaining_hours:Q", title="Predicted Remaining Hours", format=".2f"),
                 ],
             )
+            .add_params(duration_select)
             .properties(height=500)
         )
-        st.altair_chart(duration_prediction_chart, width="stretch")
+        duration_event = st.altair_chart(
+            duration_prediction_chart,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="duration_prediction_select",
+            key="duration_prediction_chart",
+        )
         _model_metrics_strip(
             "Trending Duration Prediction",
             load_duration_prediction_metrics(df),
         )
+        duration_context = _extract_chart_selection(
+            duration_event,
+            "duration_prediction_select",
+            ["title"],
+        )
+        selected_duration_title = _normalize_context_value(duration_context.get("title"))
+        if selected_duration_title:
+            duration_row = duration_prediction_df[
+                duration_prediction_df["title"] == selected_duration_title
+            ].iloc[0]
+            _render_suggestion_box(
+                f"Suggestions for `{selected_duration_title}`",
+                _suggest_from_duration_prediction(duration_row),
+            )
 
     st.subheader("Peak Rank and Category Forecasting")
     st.markdown("These charts estimate the best future rank a current video may reach and the next category-share trajectory using the accumulated time-series history.")
@@ -2710,6 +2202,13 @@ with tab2:
     if peak_rank_forecast_df.empty:
         st.info("Peak-rank forecasting needs more historical trajectories first.")
     else:
+        peak_rank_select = alt.selection_point(
+            name="peak_rank_select",
+            fields=["title"],
+            on="click",
+            toggle=False,
+            empty=False,
+        )
         peak_rank_chart = (
             alt.Chart(peak_rank_forecast_df)
             .mark_bar()
@@ -2717,6 +2216,7 @@ with tab2:
                 x=alt.X("expected_rank_gain:Q", title="Expected Rank Improvement"),
                 y=alt.Y("title:N", sort="-x", title="Video"),
                 color=alt.Color("category_name:N", title="Category"),
+                opacity=alt.condition(peak_rank_select, alt.value(1), alt.value(0.4)),
                 tooltip=[
                     "title",
                     "category_name",
@@ -2728,224 +2228,92 @@ with tab2:
                     alt.Tooltip("current_velocity:Q", title="Current Velocity", format=".2f"),
                 ],
             )
+            .add_params(peak_rank_select)
             .properties(height=450)
         )
-        st.altair_chart(peak_rank_chart, width="stretch")
+        peak_rank_event = st.altair_chart(
+            peak_rank_chart,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="peak_rank_select",
+            key="peak_rank_chart",
+        )
         _model_metrics_strip(
             "Peak Rank Forecast",
             load_peak_rank_metrics(df),
         )
+        peak_context = _extract_chart_selection(
+            peak_rank_event,
+            "peak_rank_select",
+            ["title"],
+        )
+        selected_peak_title = _normalize_context_value(peak_context.get("title"))
+        if selected_peak_title:
+            peak_row = peak_rank_forecast_df[
+                peak_rank_forecast_df["title"] == selected_peak_title
+            ].iloc[0]
+            _render_suggestion_box(
+                f"Suggestions for `{selected_peak_title}`",
+                _suggest_from_peak_rank_forecast(peak_row),
+            )
 
     if category_share_forecast_df.empty:
         st.info("Category-share forecasting needs at least 2 time buckets per category.")
     else:
+        share_select = alt.selection_point(
+            name="category_share_select",
+            fields=["category_name"],
+            on="click",
+            toggle=False,
+            empty=False,
+            nearest=True,
+        )
+        share_base = alt.Chart(category_share_forecast_df).encode(
+            x=alt.X("time_bucket:T", title="Time"),
+            y=alt.Y("forecast_share:Q", title="Forecast Category Share"),
+            color=alt.Color("category_name:N", title="Category"),
+            opacity=alt.condition(share_select, alt.value(1), alt.value(0.35)),
+            strokeDash=alt.StrokeDash("series:N", title="Series"),
+            tooltip=[
+                "category_name",
+                "series",
+                "time_bucket",
+                alt.Tooltip("forecast_share:Q", title="Category Share", format=".2%"),
+            ],
+        )
+        share_lines = share_base.mark_line()
+        share_points = (
+            share_base.mark_point(size=90, filled=True)
+            .add_params(share_select)
+        )
         category_share_chart = (
-            alt.Chart(category_share_forecast_df)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("time_bucket:T", title="Time"),
-                y=alt.Y("forecast_share:Q", title="Forecast Category Share"),
-                color=alt.Color("category_name:N", title="Category"),
-                strokeDash=alt.StrokeDash("series:N", title="Series"),
-                tooltip=[
-                    "category_name",
-                    "series",
-                    "time_bucket",
-                    alt.Tooltip("forecast_share:Q", title="Category Share", format=".2%"),
-                ],
-            )
+            alt.layer(share_lines, share_points)
             .properties(height=400)
         )
-        st.altair_chart(category_share_chart, width="stretch")
+        share_event = st.altair_chart(
+            category_share_chart,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="category_share_select",
+            key="category_share_chart",
+        )
         _model_metrics_strip(
             "Category Share Forecast",
             load_category_share_metrics(df),
         )
-
-with tab3:
-    st.subheader("3. What should be done?")
-    st.markdown("Prescriptive analytics converts the historical and current signals into recommended actions: when to post, where gaps exist, who to partner with, what content format to favor, when to intervene, and which regions to expand into.")
-
-    st.subheader("Optimal Posting Window")
-    st.markdown("Mode 2: Deduplicated historical. This ranks day-hour slots by average peak views with sample-size awareness.")
-    if optimal_posting_df.empty:
-        st.info("No posting-window recommendation data available.")
-    else:
-        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        posting_heatmap_df = optimal_posting_df.copy()
-        posting_heatmap_df["publish_day"] = pd.Categorical(posting_heatmap_df["publish_day"], categories=day_order, ordered=True)
-
-        posting_heatmap = (
-            alt.Chart(posting_heatmap_df)
-            .mark_rect()
-            .encode(
-                x=alt.X("publish_hour_utc:O", title="Publish Hour (UTC)"),
-                y=alt.Y("publish_day:O", title="Publish Day"),
-                color=alt.Color("avg_peak_views:Q", title="Avg Peak Views"),
-                tooltip=[
-                    "category_name",
-                    "trending_region",
-                    "publish_day",
-                    "publish_hour_utc",
-                    alt.Tooltip("avg_peak_views:Q", title="Avg Peak Views", format=","),
-                    "sample_size",
-                    "slot_rank",
-                ],
-            )
-            .properties(height=350)
+        share_context = _extract_chart_selection(
+            share_event,
+            "category_share_select",
+            ["category_name"],
         )
-        st.altair_chart(posting_heatmap, width="stretch")
-
-        best_slots = optimal_posting_df[optimal_posting_df["slot_rank"] == 1].copy()
-        if not best_slots.empty:
-            st.dataframe(best_slots, width="stretch")
-
-    st.subheader("Trending Gap Opportunity Detector")
-    st.markdown("Latest snapshot versus 7-day baseline. Categories with the biggest deficit are immediate opportunity spaces.")
-    if gap_opportunity_df.empty:
-        st.info("No trending-gap opportunity data available.")
-    else:
-        gap_chart = (
-            alt.Chart(gap_opportunity_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("gap_z_score:Q", title="Gap Z-Score"),
-                y=alt.Y("category_name:N", sort="-x", title="Category"),
-                color=alt.Color("status:N", title="Status"),
-                tooltip=[
-                    "category_name",
-                    "trending_region",
-                    "current_count",
-                    "avg_count",
-                    alt.Tooltip("gap_z_score:Q", title="Gap Z-Score", format=".2f"),
-                    "status",
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart(gap_chart, width="stretch")
-
-    st.subheader("Creator Partnership Recommendation Engine")
-    st.markdown("Mode 2: Deduplicated historical. This surfaces channels with repeat trending success and strong partnership fit.")
-    if creator_partnership_df.empty:
-        st.info("No creator partnership data available.")
-    else:
-        partner_chart = (
-            alt.Chart(creator_partnership_df.head(25))
-            .mark_bar()
-            .encode(
-                x=alt.X("partnership_score:Q", title="Partnership Score"),
-                y=alt.Y("channel_title:N", sort="-x", title="Channel"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "channel_title",
-                    "trending_region",
-                    "category_name",
-                    "trending_video_count",
-                    alt.Tooltip("avg_er:Q", title="Avg Engagement Rate", format=".2%"),
-                    alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                    alt.Tooltip("partnership_score:Q", title="Partnership Score", format=".2f"),
-                ],
-            )
-            .properties(height=500)
-        )
-        st.altair_chart(partner_chart, width="stretch")
-
-    st.subheader("Format Prescriptions")
-    st.markdown("Mode 2: Deduplicated historical. These patterns recommend what kind of packaging performs best by category.")
-    if format_prescriptions_df.empty:
-        st.info("No format-prescription data available.")
-    else:
-        format_chart = (
-            alt.Chart(format_prescriptions_df.head(40))
-            .mark_bar()
-            .encode(
-                x=alt.X("prescription_score:Q", title="Prescription Score"),
-                y=alt.Y("feature_value:N", sort="-x", title="Recommended Feature"),
-                color=alt.Color("feature_type:N", title="Feature Type"),
-                tooltip=[
-                    "category_name",
-                    "feature_type",
-                    "feature_value",
-                    alt.Tooltip("avg_er:Q", title="Avg Engagement Rate", format=".2%"),
-                    alt.Tooltip("avg_views:Q", title="Avg Views", format=","),
-                    "sample_size",
-                    alt.Tooltip("prescription_score:Q", title="Prescription Score", format=".2f"),
-                ],
-            )
-            .properties(height=500)
-        )
-        st.altair_chart(format_chart, width="stretch")
-
-    st.subheader("Campaign Timing Alerts")
-    st.markdown("Mode 3: Full time-series. This flags videos that should be boosted now, watched closely, or are losing momentum.")
-    if campaign_alerts_df.empty:
-        st.info("Campaign timing alerts need at least 3 consecutive observations per video.")
-    else:
-        alert_chart = (
-            alt.Chart(campaign_alerts_df.head(30))
-            .mark_bar()
-            .encode(
-                x=alt.X("total_rank_gain:Q", title="3-Batch Rank Gain"),
-                y=alt.Y("title:N", sort="-x", title="Video"),
-                color=alt.Color("alert_type:N", title="Alert Type"),
-                tooltip=[
-                    "title",
-                    "category_name",
-                    "trending_region",
-                    "current_rank",
-                    alt.Tooltip("avg_rank_delta:Q", title="Avg Rank Delta", format=".2f"),
-                    "total_rank_gain",
-                    alt.Tooltip("latest_views:Q", title="Latest Views", format=","),
-                    "alert_type",
-                ],
-            )
-            .properties(height=500)
-        )
-        st.altair_chart(alert_chart, width="stretch")
-
-    st.subheader("Regional Expansion Recommendations")
-    st.markdown("Mode 2: Deduplicated historical. This estimates which target regions are the strongest next expansion markets.")
-    if regional_expansion_df.empty:
-        st.info("No regional expansion recommendation data available.")
-    else:
-        expansion_chart = (
-            alt.Chart(regional_expansion_df.head(40))
-            .mark_circle(size=180)
-            .encode(
-                x=alt.X("source_region:N", title="Source Region"),
-                y=alt.Y("target_region:N", title="Target Region"),
-                size=alt.Size("expansion_probability:Q", title="Expansion Probability"),
-                color=alt.Color("category_name:N", title="Category"),
-                tooltip=[
-                    "category_name",
-                    "source_region",
-                    "target_region",
-                    "shared_videos",
-                    "source_videos",
-                    alt.Tooltip("expansion_probability:Q", title="Expansion Probability", format=".2%"),
-                ],
-            )
-            .properties(height=500)
-        )
-        st.altair_chart(expansion_chart, width="stretch")
-
-    st.subheader("Decision Summary")
-    if not summary_df.empty:
-        best_views_category = summary_df.iloc[0]["category_name"]
-        best_engagement_category = summary_df.sort_values("avg_engagement_rate", ascending=False).iloc[0]["category_name"]
-        st.write(f"- Best category to scale for reach: **{best_views_category}**")
-        st.write(f"- Best category to scale for engagement quality: **{best_engagement_category}**")
-        if not gap_opportunity_df.empty:
-            top_gap = gap_opportunity_df.iloc[0]
-            st.write(
-                f"- Biggest current whitespace: **{top_gap['category_name']}** in **{top_gap['trending_region']}** "
-                f"(gap z-score {top_gap['gap_z_score']:.2f})"
-            )
-        if not optimal_posting_df.empty:
-            top_slot = optimal_posting_df.sort_values(["slot_rank", "avg_peak_views"]).iloc[0]
-            st.write(
-                f"- Best observed posting slot in current filter: **{top_slot['publish_day']} at {int(top_slot['publish_hour_utc']):02d}:00 UTC**"
+        selected_share_category = _normalize_context_value(share_context.get("category_name"))
+        if selected_share_category:
+            share_rows = category_share_forecast_df[
+                category_share_forecast_df["category_name"] == selected_share_category
+            ].copy()
+            _render_suggestion_box(
+                f"Suggestions for `{selected_share_category}`",
+                _suggest_from_category_share_forecast(share_rows),
             )
 
 with st.expander("Raw Data"):

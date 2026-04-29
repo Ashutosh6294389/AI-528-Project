@@ -802,3 +802,360 @@ def build_tag_density_performance_diagnostic(
             F.countDistinct("video_id").alias("unique_videos"),
         )
     )
+
+
+# ===========================================================================
+# v2 diagnostics: mechanical decompositions of the descriptive trend
+# ===========================================================================
+# Each pair below decomposes one descriptive chart's trend into the levers
+# that produced it (volume vs strength, persistence vs participation, etc.)
+# rather than reporting parallel facts. See proposal in the dashboard
+# discussion for the rationale per chart.
+
+# ----- 1. Views Trend Over Time by Category --------------------------------
+def build_views_volume_strength_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str,
+    trending_region: str | None = None,
+) -> DataFrame:
+    """Decomposes total_views over time into (unique_videos × avg_views_per_video)
+    so the user can see whether growth is volume-led or strength-led."""
+    sdf = _load_filtered_silver(
+        spark, silver_path, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    return (
+        sdf.groupBy("time_bucket")
+        .agg(
+            F.countDistinct("video_id").alias("unique_videos"),
+            F.avg("view_count").alias("avg_views_per_video"),
+            F.sum("view_count").alias("total_views"),
+        )
+        .orderBy("time_bucket")
+    )
+
+
+def build_views_new_vs_carryover_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str,
+    trending_region: str | None = None,
+) -> DataFrame:
+    """For each time_bucket, splits videos into 'New entry' (first time
+    seen in trending in the window) vs 'Carry-over' (seen earlier).
+    Tells the user whether the trend is fed by fresh content or by
+    existing videos persisting."""
+    sdf = _load_filtered_silver(
+        spark, silver_path, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    first_seen = (
+        sdf.groupBy("video_id")
+        .agg(F.min("time_bucket").alias("first_time_bucket"))
+    )
+    annotated = (
+        sdf.join(first_seen, on="video_id", how="inner")
+        .withColumn(
+            "entry_status",
+            F.when(
+                F.col("time_bucket") == F.col("first_time_bucket"),
+                F.lit("New entry"),
+            ).otherwise(F.lit("Carry-over")),
+        )
+        .dropDuplicates(["video_id", "time_bucket", "entry_status"])
+    )
+    return (
+        annotated.groupBy("time_bucket", "entry_status")
+        .agg(F.countDistinct("video_id").alias("videos"))
+        .orderBy("time_bucket", "entry_status")
+    )
+
+
+# ----- 2. Video Duration Distribution --------------------------------------
+def build_duration_slot_footprint_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str | None = None,
+    trending_region: str | None = None,
+) -> DataFrame:
+    """Per duration_bucket: distinct videos that hit trending (volume lever)
+    and avg batches each one persists (stickiness lever). Decomposes
+    bucket dominance into volume vs persistence."""
+    sdf = _load_filtered_silver(
+        spark, silver_path, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    sdf = sdf.filter(F.col("duration_bucket").isNotNull())
+    per_video = (
+        sdf.groupBy("video_id", "duration_bucket")
+        .agg(F.countDistinct("collection_batch_id").alias("batches"))
+    )
+    return (
+        per_video.groupBy("duration_bucket")
+        .agg(
+            F.countDistinct("video_id").alias("distinct_videos"),
+            F.avg("batches").alias("avg_batches_per_video"),
+            (
+                F.countDistinct("video_id") * F.avg("batches")
+            ).alias("slot_footprint"),
+        )
+    )
+
+
+def build_duration_audience_response_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str | None = None,
+    trending_region: str | None = None,
+) -> DataFrame:
+    """Per duration_bucket: avg engagement_rate and avg views per video.
+    Tells the user whether bucket dominance reflects audience preference
+    or just publishing volume."""
+    sdf = _load_filtered_silver(
+        spark, silver_path, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    sdf = sdf.filter(F.col("duration_bucket").isNotNull())
+    return (
+        sdf.groupBy("duration_bucket")
+        .agg(
+            F.avg("engagement_rate").alias("avg_engagement_rate"),
+            F.avg("view_count").alias("avg_views_per_video"),
+            F.countDistinct("video_id").alias("unique_videos"),
+        )
+    )
+
+
+# ----- 3. Channel Subscriber Size Distribution -----------------------------
+def build_tier_effort_reward_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str | None = None,
+    trending_region: str | None = None,
+) -> DataFrame:
+    """Per subscriber_tier: distinct channels participating × avg trending
+    slots per channel. Decomposes tier dominance into broad participation
+    vs concentrated dominance."""
+    sdf = _add_subscriber_tier_column(
+        _load_filtered_silver(
+            spark, silver_path, history_window,
+            category_name=category_name, trending_region=trending_region,
+        )
+    )
+    sdf = sdf.filter(F.col("channel_id").isNotNull())
+    per_channel = (
+        sdf.groupBy("subscriber_tier", "channel_id")
+        .agg(F.count("*").alias("slot_observations"))
+    )
+    return (
+        per_channel.groupBy("subscriber_tier")
+        .agg(
+            F.countDistinct("channel_id").alias("distinct_channels"),
+            F.avg("slot_observations").alias("avg_slots_per_channel"),
+            F.sum("slot_observations").alias("total_slot_observations"),
+        )
+    )
+
+
+def build_tier_persistence_engagement_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str | None = None,
+    trending_region: str | None = None,
+) -> DataFrame:
+    """Per subscriber_tier: avg batches each video persists × avg
+    engagement rate. Decomposes whether a tier holds slots through
+    stickiness or audience response."""
+    sdf = _add_subscriber_tier_column(
+        _load_filtered_silver(
+            spark, silver_path, history_window,
+            category_name=category_name, trending_region=trending_region,
+        )
+    )
+    per_video = (
+        sdf.groupBy("video_id", "subscriber_tier")
+        .agg(
+            F.countDistinct("collection_batch_id").alias("batches"),
+            F.avg("engagement_rate").alias("video_er"),
+        )
+    )
+    return (
+        per_video.groupBy("subscriber_tier")
+        .agg(
+            F.avg("batches").alias("avg_batches_per_video"),
+            F.avg("video_er").alias("avg_engagement_rate"),
+            F.countDistinct("video_id").alias("unique_videos"),
+        )
+    )
+
+
+# ----- 4. Top Tag Usage Frequency ------------------------------------------
+def build_tag_adoption_intensity_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str | None = None,
+    trending_region: str | None = None,
+    top_n: int = 15,
+) -> DataFrame:
+    """For each top tag: distinct channels using it × avg videos per
+    channel. Decomposes a tag's frequency into broad adoption vs
+    per-channel intensity."""
+    sdf = _load_filtered_silver(
+        spark, silver_path, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    exploded = (
+        sdf.withColumn("tag", F.explode("tags_array"))
+        .filter(F.col("tag").isNotNull() & (F.trim(F.col("tag")) != ""))
+        .filter(F.col("channel_id").isNotNull())
+    )
+    top_tags_df = (
+        exploded.groupBy("tag")
+        .agg(F.countDistinct("video_id").alias("videos_using_tag"))
+        .orderBy(F.desc("videos_using_tag"))
+        .limit(top_n)
+    )
+    top_list = [r["tag"] for r in top_tags_df.collect()]
+    if not top_list:
+        return top_tags_df  # empty schema, dashboard will detect via .empty
+
+    filtered = exploded.filter(F.col("tag").isin(top_list))
+    return (
+        filtered.groupBy("tag")
+        .agg(
+            F.countDistinct("channel_id").alias("distinct_channels"),
+            F.countDistinct("video_id").alias("videos_using_tag"),
+        )
+        .withColumn(
+            "videos_per_channel",
+            F.col("videos_using_tag") / F.col("distinct_channels"),
+        )
+        .orderBy(F.desc("videos_using_tag"))
+    )
+
+
+def build_tag_cooccurrence_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str | None = None,
+    trending_region: str | None = None,
+    top_n: int = 12,
+) -> DataFrame:
+    """For the most-used tag in scope, returns the other tags that ride
+    along with it most often. Reveals whether the dominance is part of
+    a multi-tag template (one tag dominates co-occurrence) or whether
+    the tag is genuinely versatile (co-occurrences spread out)."""
+    sdf = _load_filtered_silver(
+        spark, silver_path, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    exploded = (
+        sdf.withColumn("tag", F.explode("tags_array"))
+        .filter(F.col("tag").isNotNull() & (F.trim(F.col("tag")) != ""))
+        .select("video_id", "tag")
+        .distinct()
+    )
+    top1 = (
+        exploded.groupBy("tag")
+        .agg(F.countDistinct("video_id").alias("videos"))
+        .orderBy(F.desc("videos"))
+        .limit(1)
+        .collect()
+    )
+    if not top1:
+        return exploded.limit(0).select("tag").withColumn("co_videos", F.lit(0)).withColumn("primary_tag", F.lit(""))
+
+    primary = top1[0]["tag"]
+    primary_videos = top1[0]["videos"] or 1
+
+    videos_with_primary = (
+        exploded.filter(F.col("tag") == primary).select("video_id").distinct()
+    )
+    co_tags = (
+        exploded.join(videos_with_primary, on="video_id", how="inner")
+        .filter(F.col("tag") != primary)
+        .groupBy("tag")
+        .agg(F.countDistinct("video_id").alias("co_videos"))
+        .withColumn("co_share", F.col("co_videos") / F.lit(primary_videos))
+        .withColumn("primary_tag", F.lit(primary))
+        .orderBy(F.desc("co_videos"))
+        .limit(top_n)
+    )
+    return co_tags
+
+
+# ----- 5. Trending Rank Distribution by Category ---------------------------
+def build_rank_slot_turnover_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str,
+    trending_region: str | None = None,
+) -> DataFrame:
+    """Per (region within scope): distinct videos that ever held a slot,
+    total slot-batch observations, and turnover_rate = distinct_videos /
+    slot_observations. High turnover = vibrant pipeline; low = a few
+    persistent videos hogging the category."""
+    sdf = _load_filtered_silver(
+        spark, silver_path, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    sdf = sdf.filter(F.col("trending_rank").isNotNull())
+    return (
+        sdf.groupBy("trending_region")
+        .agg(
+            F.countDistinct("video_id").alias("distinct_videos"),
+            F.count("*").alias("slot_observations"),
+        )
+        .withColumn(
+            "turnover_rate",
+            F.when(
+                F.col("slot_observations") > 0,
+                F.col("distinct_videos") / F.col("slot_observations"),
+            ).otherwise(F.lit(0)),
+        )
+        .orderBy(F.desc("turnover_rate"))
+    )
+
+
+def build_rank_channel_concentration_v2_diagnostic(
+    spark: SparkSession,
+    silver_path: str,
+    history_window: str,
+    category_name: str,
+    trending_region: str | None = None,
+    top_n: int = 12,
+) -> DataFrame:
+    """For the selected category: each channel's share of all slot
+    observations, top_n. Lets the user judge whether a category is
+    held up by a few dominant channels (high top-3 share) or broadly
+    distributed."""
+    sdf = _load_filtered_silver(
+        spark, silver_path, history_window,
+        category_name=category_name, trending_region=trending_region,
+    )
+    sdf = sdf.filter(
+        F.col("trending_rank").isNotNull() & F.col("channel_title").isNotNull()
+    )
+    per_channel = (
+        sdf.groupBy("channel_title")
+        .agg(F.count("*").alias("slot_observations"))
+    )
+    total = per_channel.agg(F.sum("slot_observations").alias("t")).collect()[0]["t"] or 1
+    return (
+        per_channel.withColumn(
+            "share_pct",
+            F.col("slot_observations") / F.lit(total) * F.lit(100.0),
+        )
+        .orderBy(F.desc("slot_observations"))
+        .limit(top_n)
+    )
