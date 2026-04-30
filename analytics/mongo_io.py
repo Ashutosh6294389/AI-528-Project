@@ -1,22 +1,15 @@
 """Centralised MongoDB I/O for the YouTube analytics pipeline.
 
 This module is the single point of contact between Spark and MongoDB.
-All bronze / silver / gold reads and writes go through here, which means
-any change in URI, database name, or connector options touches only one
-file.
+In the current hybrid architecture Bronze still uses MongoDB, while
+Silver/Gold are local Delta tables.
 
 NoSQL advantages we deliberately exploit:
   * Schema flexibility — Silver records keep `tags_array` as a native BSON
     array (no flattening / explode-at-write step). Channel metadata stays
     nested.
-  * Compound indexes — every collection gets the index its dashboard
-    queries actually use, so reads stay fast as data grows.
   * TTL on Bronze — raw documents auto-expire after a configurable
     retention window. Delta cannot do that natively.
-  * `$out`-style atomic overwrite — Gold collections are rebuilt with
-    `mode("overwrite")` which the connector implements as a write to a
-    staging collection followed by an atomic rename, so dashboard reads
-    never see a half-built table.
 """
 from __future__ import annotations
 
@@ -30,6 +23,8 @@ from pyspark.sql import DataFrame, SparkSession
 # ---------------------------------------------------------------------------
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.environ.get("MONGO_DB", "youtube_analytics")
+BRONZE_MONGO_URI = os.environ.get("BRONZE_MONGO_URI", "mongodb://localhost:27017")
+BRONZE_MONGO_DB = os.environ.get("BRONZE_MONGO_DB", MONGO_DB)
 
 # Spark MongoDB connector v10+ — declared via spark.jars.packages in the
 # session builders. This constant is exposed so callers can include it in
@@ -64,6 +59,9 @@ def mongo_write(
     df: DataFrame,
     collection: str,
     mode: str = "append",
+    *,
+    connection_uri: str | None = None,
+    database: str | None = None,
 ) -> None:
     """Write a Spark DataFrame to a MongoDB collection.
 
@@ -73,8 +71,8 @@ def mongo_write(
     (
         df.write.format("mongodb")
         .mode(mode)
-        .option("connection.uri", MONGO_URI)
-        .option("database", MONGO_DB)
+        .option("connection.uri", connection_uri or MONGO_URI)
+        .option("database", database or MONGO_DB)
         .option("collection", collection)
         .save()
     )
@@ -113,13 +111,11 @@ def _create_index_safe(coll, keys: Iterable, **kwargs) -> None:
 
 
 def setup_indexes(verbose: bool = True) -> None:
-    """Create the indexes (and Bronze TTL) the dashboard relies on. Safe
-    to call repeatedly — each create_index is wrapped to swallow 'already
-    exists' errors."""
+    """Create the Bronze indexes (and TTL). Safe to call repeatedly."""
     from pymongo import ASCENDING, DESCENDING, MongoClient
 
-    client = MongoClient(MONGO_URI)
-    db = client[MONGO_DB]
+    client = MongoClient(BRONZE_MONGO_URI)
+    db = client[BRONZE_MONGO_DB]
 
     # ---- Bronze ----------------------------------------------------------
     bronze = db["bronze_raw"]
@@ -135,38 +131,8 @@ def setup_indexes(verbose: bool = True) -> None:
         name="bronze_ttl",
     )
 
-    # ---- Silver ----------------------------------------------------------
-    silver = db["silver_enriched"]
-    _create_index_safe(
-        silver,
-        [
-            ("trending_region", ASCENDING),
-            ("category_name", ASCENDING),
-            ("time_bucket", ASCENDING),
-        ],
-        name="silver_region_category_time",
-    )
-    _create_index_safe(silver, [("video_id", ASCENDING), ("trending_region", ASCENDING)])
-    _create_index_safe(silver, [("collected_at_ts", DESCENDING)])
-    _create_index_safe(silver, [("duration_bucket", ASCENDING)])
-
-    # ---- Gold ------------------------------------------------------------
-    gold_indexes = {
-        "gold_latest_snapshot": [("video_id", ASCENDING), ("trending_region", ASCENDING)],
-        "gold_category_summary": [("category_name", ASCENDING), ("trending_region", ASCENDING)],
-        "gold_views_timeseries": [("category_name", ASCENDING), ("trending_region", ASCENDING), ("time_bucket", ASCENDING)],
-        "gold_region_timeseries": [("trending_region", ASCENDING), ("time_bucket", ASCENDING)],
-        "gold_channel_leaderboard": [("channel_title", ASCENDING)],
-        "gold_duration_distribution": [("trending_region", ASCENDING), ("category_name", ASCENDING), ("duration_bucket", ASCENDING)],
-        "gold_subscriber_tier_distribution": [("trending_region", ASCENDING), ("category_name", ASCENDING), ("subscriber_tier", ASCENDING)],
-        "gold_tag_usage_frequency": [("tag", ASCENDING), ("trending_region", ASCENDING), ("category_name", ASCENDING)],
-        "gold_trending_rank_distribution": [("trending_region", ASCENDING), ("category_name", ASCENDING)],
-    }
-    for coll_name, idx_keys in gold_indexes.items():
-        _create_index_safe(db[coll_name], idx_keys)
-
     if verbose:
-        print(f"[mongo_io] indexes ready on {MONGO_URI}/{MONGO_DB}")
+        print(f"[mongo_io] bronze indexes ready on {BRONZE_MONGO_URI}/{BRONZE_MONGO_DB}")
 
 
 def attach_mongo_jars(builder):

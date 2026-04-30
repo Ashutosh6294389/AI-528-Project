@@ -13,35 +13,52 @@ from pyspark.sql.types import (
 )
 
 # Make sibling packages importable when this script is run directly.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from analytics.mongo_io import MONGO_SPARK_PACKAGE, mongo_write
+from analytics.mongo_io import BRONZE_MONGO_DB, BRONZE_MONGO_URI, MONGO_SPARK_PACKAGE, mongo_write
+from runtime_config import (
+    KAFKA_SPARK_PACKAGES,
+    KAFKA_TOPIC,
+    build_kafka_spark_options,
+    local_delta_jars_csv,
+    local_kafka_jars_csv,
+    resolve_spark_master,
+    use_local_kafka_jars,
+)
 from storage_paths import ensure_medallion_paths
 from transformations import build_silver_df, refresh_gold_tables
 
 
-KAFKA_BROKER = "localhost:9092"
-TOPIC = "youtube-data"
+TOPIC = KAFKA_TOPIC
 MEDALLION_PATHS = ensure_medallion_paths()
 BRONZE_COLLECTION = MEDALLION_PATHS["bronze"]
 SILVER_COLLECTION = MEDALLION_PATHS["silver"]
 GOLD_COLLECTIONS = MEDALLION_PATHS["gold"]
 CHECKPOINT_PATH = MEDALLION_PATHS["checkpoint"]
 
+builder = SparkSession.builder.appName("YouTubeMedallionStreaming")
+spark_master = resolve_spark_master("local[*]")
+if spark_master:
+    builder = builder.master(spark_master)
+
+package_list = [MONGO_SPARK_PACKAGE]
+if not use_local_kafka_jars():
+    package_list.append(KAFKA_SPARK_PACKAGES)
+
+builder = builder.config("spark.jars.packages", ",".join(package_list))
+
+local_jars = [local_delta_jars_csv(PROJECT_ROOT)]
+if use_local_kafka_jars():
+    local_jars.append(local_kafka_jars_csv(PROJECT_ROOT))
+local_jars = [value for value in local_jars if value]
+if local_jars:
+    builder = builder.config("spark.jars", ",".join(local_jars))
 
 spark = (
-    SparkSession.builder.appName("YouTubeMedallionStreaming")
-    .master("local[*]")
-    # The MongoDB connector is fetched via Maven on first run; the Kafka
-    # JARs are still loaded from the local jars/ folder.
-    .config("spark.jars.packages", MONGO_SPARK_PACKAGE)
-    .config(
-        "spark.jars",
-        "jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,"
-        "jars/spark-token-provider-kafka-0-10_2.12-3.4.1.jar,"
-        "jars/kafka-clients-3.4.1.jar,"
-        "jars/commons-pool2-2.11.1.jar",
-    )
+    builder
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
     # Heap sizing — Gold refresh scans the entire Silver collection, so
     # the driver/executor needs enough RAM to hold a partition of BSON
     # documents while the connector decodes them.
@@ -113,12 +130,18 @@ def process_batch(batch_df, batch_id: int) -> None:
     # Bronze: raw documents land in MongoDB exactly as they came off Kafka,
     # with our ingestion metadata. The TTL index on `ingestion_timestamp`
     # auto-expires old records (configurable via BRONZE_TTL_DAYS).
-    mongo_write(parsed_batch, BRONZE_COLLECTION, mode="append")
+    mongo_write(
+        parsed_batch,
+        BRONZE_COLLECTION,
+        mode="append",
+        connection_uri=BRONZE_MONGO_URI,
+        database=BRONZE_MONGO_DB,
+    )
 
     # Silver: enriched + typed documents — `tags_array` is stored as a
-    # native BSON array, no flattening at write time.
+    # local Delta table for fast dashboard queries.
     silver_batch = build_silver_df(parsed_batch)
-    mongo_write(silver_batch, SILVER_COLLECTION, mode="append")
+    silver_batch.write.format("delta").mode("append").save(SILVER_COLLECTION)
 
     # Gold: nine aggregated collections rebuilt atomically from Silver.
     # Skipped on most batches — Gold scanning the full Silver every 45 s
@@ -136,13 +159,10 @@ def process_batch(batch_df, batch_id: int) -> None:
     print(f"Processed batch {batch_id}: bronze appended, silver appended, {gold_msg}.")
 
 
-kafka_df = (
-    spark.readStream.format("kafka")
-    .option("kafka.bootstrap.servers", KAFKA_BROKER)
-    .option("subscribe", TOPIC)
-    .option("startingOffsets", "latest")
-    .load()
-)
+kafka_reader = spark.readStream.format("kafka")
+for option_name, option_value in build_kafka_spark_options(TOPIC).items():
+    kafka_reader = kafka_reader.option(option_name, option_value)
+kafka_df = kafka_reader.load()
 
 parsed_stream = (
     kafka_df.selectExpr("CAST(value AS STRING) as json_value")
@@ -158,8 +178,8 @@ query = (
 )
 
 print(
-    "Spark streaming started. Writing Bronze/Silver/Gold to MongoDB at "
-    f"{__import__('analytics.mongo_io', fromlist=['MONGO_URI']).MONGO_URI} / "
-    f"{__import__('analytics.mongo_io', fromlist=['MONGO_DB']).MONGO_DB}"
+    "Spark streaming started. Writing Bronze to MongoDB at "
+    f"{BRONZE_MONGO_URI} / {BRONZE_MONGO_DB}; "
+    f"Silver/Gold to local Delta under {PROJECT_ROOT / 'storage' / 'delta_tables'}"
 )
 query.awaitTermination()

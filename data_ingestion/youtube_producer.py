@@ -2,13 +2,18 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+import sys
 
 import requests
 from kafka import KafkaProducer
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from config import (
     API_KEY,
-    KAFKA_BROKER,
     TOPIC,
     REGIONS,
     CATEGORY_IDS,
@@ -18,6 +23,7 @@ from config import (
     REQUEST_TIMEOUT,
     CHANNEL_BATCH_SIZE,
     DESCRIPTION_LIMIT,
+    build_kafka_python_producer_kwargs,
 )
  
 BASE_URL = "https://www.googleapis.com/youtube/v3"
@@ -28,7 +34,7 @@ if not API_KEY or API_KEY == "YOUR_REAL_YOUTUBE_API_KEY":
 session = requests.Session()
 
 producer = KafkaProducer(
-    bootstrap_servers=KAFKA_BROKER,
+    **build_kafka_python_producer_kwargs(),
     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
 )
 

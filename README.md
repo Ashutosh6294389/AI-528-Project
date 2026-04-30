@@ -1,33 +1,35 @@
-1. Activate the environment
+# AI528 YouTube Analytics Pipeline
+
+This project ingests YouTube trending data, streams it through Kafka,
+stores Bronze in MongoDB, stores Silver/Gold as local Delta tables, and
+serves a Streamlit dashboard on top.
+
+Full technical documentation is available in [docs/project_documentation.md](/Users/ashutoshsingh/Desktop/AI-528_GOATS/AI528/docs/project_documentation.md:1).
+
+## Quick start (local)
 
 ```bash
-cd ~/Downloads/AI528
+cd /Users/ashutoshsingh/Desktop/AI-528_GOATS/AI528
 source venv/bin/activate
 export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 export PATH=$JAVA_HOME/bin:$PATH
 ```
 
-2. Start MongoDB (data store)
+Optional: copy values from `.env.example` into your shell or `.env`.
+
+### 1. Start MongoDB
 
 ```bash
-brew services start mongodb-community         # or: mongod --config /opt/homebrew/etc/mongod.conf
+brew services start mongodb-community
 ```
 
-Optional connection overrides (defaults shown):
-
-```bash
-export MONGO_URI="mongodb://localhost:27017"
-export MONGO_DB="youtube_analytics"
-export BRONZE_TTL_DAYS=30                  # auto-expire Bronze docs
-```
-
-3. Start Kafka
+### 2. Start Kafka
 
 ```bash
 /opt/homebrew/opt/kafka/bin/kafka-server-start /opt/homebrew/etc/kafka/server.properties
 ```
 
-3. Create the topic once
+Create the topic once:
 
 ```bash
 /opt/homebrew/opt/kafka/bin/kafka-topics \
@@ -38,69 +40,55 @@ export BRONZE_TTL_DAYS=30                  # auto-expire Bronze docs
   --replication-factor 1
 ```
 
-4. Run the producer
+### 3. Run the apps
 
 ```bash
 python3 data_ingestion/youtube_producer.py
-```
-
-5. Run the Spark medallion pipeline
-
-```bash
 python3 spark_processing/spark_streaming.py
-```
-
-6. Open the dashboard
-
-```bash
 streamlit run dashboard/app.py
 ```
 
-Current medallion layout (MongoDB-backed)
+## Storage model
 
-All three layers now live in MongoDB. Streaming checkpoints stay on disk
-(Spark requirement).
+The medallion layers use a hybrid layout:
 
-Collections:
+- Bronze: `bronze_raw`
+- Silver: `storage/delta_tables/silver/youtube_enriched`
+- Gold:
+  - `storage/delta_tables/gold/latest_snapshot`
+  - `storage/delta_tables/gold/category_summary`
+  - `storage/delta_tables/gold/views_timeseries`
+  - `storage/delta_tables/gold/region_timeseries`
+  - `storage/delta_tables/gold/channel_leaderboard`
+  - `storage/delta_tables/gold/duration_distribution`
+  - `storage/delta_tables/gold/subscriber_tier_distribution`
+  - `storage/delta_tables/gold/tag_usage_frequency`
+  - `storage/delta_tables/gold/trending_rank_distribution`
 
-- Bronze: `bronze_raw` (TTL on `ingestion_timestamp`, default 30 days)
-- Silver: `silver_enriched`
-- Gold: 9 collections — `gold_latest_snapshot`, `gold_category_summary`,
-  `gold_views_timeseries`, `gold_region_timeseries`,
-  `gold_channel_leaderboard`, `gold_duration_distribution`,
-  `gold_subscriber_tier_distribution`, `gold_tag_usage_frequency`,
-  `gold_trending_rank_distribution`.
-- Streaming checkpoint: `storage/checkpoints_medallion` (on disk).
+Spark checkpoints remain on disk in:
 
-NoSQL features used:
+- `storage/checkpoints_medallion`
 
-- Compound indexes on every collection (created on first pipeline start
-  by `analytics.mongo_io.setup_indexes`).
-- TTL index on Bronze: docs older than `BRONZE_TTL_DAYS` auto-expire.
-- Native BSON arrays — `tags_array` stored as an array, no flattening.
-- Atomic Gold rebuilds via the MongoDB Spark connector's overwrite
-  mode (writes to a staging collection then renames).
+## Managed cloud support
 
-Persistence behavior
+The project is now configurable for:
 
-- Bronze is append-only inside its TTL window.
-- Silver appends cleansed records and preserves ingestion metadata.
-- Gold collections are rebuilt from Silver so dashboards always reflect
-  the latest full history.
-- Do not delete `storage/checkpoints_medallion` unless you intentionally
-  want Spark to replay Kafka data.
+- MongoDB Atlas
+- self-managed MongoDB replica sets
+- Confluent Cloud Kafka
+- local Spark or managed Spark / Databricks-style runtimes
 
-Migrating from the previous Delta layout (one-shot)
+Use environment variables from [.env.example](/Users/ashutoshsingh/Desktop/AI528/.env.example:1), then follow:
+
+- [Managed cloud setup](/Users/ashutoshsingh/Desktop/AI528/docs/managed_cloud_setup.md:1)
+
+## One-shot backfill
+
+If you still have the old local Delta dump:
 
 ```bash
-python spark_processing/backfill_medallion.py
+python3 spark_processing/backfill_medallion.py
 ```
 
-If `storage/delta_tables/youtube_enriched` exists, the script ingests
-it into Bronze + Silver and rebuilds all 9 Gold collections. With no
-Delta source present it just refreshes Gold from whatever is in Silver.
-
-
-
-
-/opt/homebrew/opt/kafka/bin/kafka-server-start /opt/homebrew/etc/kafka/server.properties
+If `storage/delta_tables/silver/youtube_enriched` exists, the script
+migrates it into Mongo Bronze + Silver and rebuilds Gold.

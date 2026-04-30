@@ -19,9 +19,8 @@ def _load_filtered_silver(
     category_name: str | None = None,
     trending_region: str | None = None,
 ) -> DataFrame:
-    """`silver_path` is now the MongoDB collection name."""
-    from analytics.mongo_io import mongo_read
-    sdf = mongo_read(spark, silver_path)
+    """Load filtered Silver rows from the local Delta table."""
+    sdf = spark.read.format("delta").load(silver_path)
 
     if category_name:
         sdf = sdf.filter(F.col("category_name") == category_name)

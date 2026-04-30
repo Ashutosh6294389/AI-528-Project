@@ -24,12 +24,10 @@ from analytics.business_analysis import (
     # numpy/pandas arrays, so they remain pandas-backed.
     build_view_count_forecast_v2,
     build_trending_duration_prediction,
-    build_peak_rank_forecast,
     build_category_share_forecast,
 )
 from analytics.predictive_metrics import (
     evaluate_category_share_forecast,
-    evaluate_peak_rank_forecast,
     evaluate_trending_duration_prediction,
     evaluate_view_count_forecast,
 )
@@ -253,27 +251,6 @@ def _suggest_from_duration_prediction(row: pd.Series) -> list[str]:
     return bullets
 
 
-def _suggest_from_peak_rank_forecast(row: pd.Series) -> list[str]:
-    expected_gain = float(row.get("expected_rank_gain", 0) or 0)
-    predicted_peak = float(row.get("predicted_peak_rank", 0) or 0)
-    velocity = float(row.get("current_velocity", 0) or 0)
-    bullets = []
-    if expected_gain >= 10:
-        bullets.append(f"The model sees major upside with about {expected_gain:.1f} ranks of headroom, so this is a strong push candidate.")
-    elif expected_gain >= 3:
-        bullets.append(f"There is moderate upside of about {expected_gain:.1f} ranks, so a selective boost makes sense if inventory is limited.")
-    else:
-        bullets.append("Expected rank improvement is limited, so treat this as steady-state content rather than a breakout bet.")
-
-    bullets.append(f"Best-case modeled peak is around rank {predicted_peak:.1f}; use that as the ceiling when setting expectations.")
-
-    if velocity > 0:
-        bullets.append("Current velocity is positive, so the right action is to reinforce what is already working instead of changing packaging mid-flight.")
-    else:
-        bullets.append("Velocity is not especially strong, so don’t assume rank headroom will realize without extra support.")
-    return bullets
-
-
 def _suggest_from_category_share_forecast(selected_rows: pd.DataFrame) -> list[str]:
     if selected_rows.empty:
         return []
@@ -374,11 +351,6 @@ def load_view_forecast_metrics(_df: pd.DataFrame) -> dict:
 @st.cache_data(ttl=120, show_spinner=False)
 def load_duration_prediction_metrics(_df: pd.DataFrame) -> dict:
     return evaluate_trending_duration_prediction(_df)
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def load_peak_rank_metrics(_df: pd.DataFrame) -> dict:
-    return evaluate_peak_rank_forecast(_df)
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -657,37 +629,35 @@ def _explain_rank_channel_concentration_v2(df) -> str:
     )
 
 
-from analytics.mongo_io import (
-    MONGO_SPARK_PACKAGE,
-    mongo_collection_has_data,
-    mongo_read,
-)
+from runtime_config import local_delta_jars_csv, resolve_spark_master
 
 
 @st.cache_resource(show_spinner=False)
 def get_spark():
+    builder = SparkSession.builder.appName("YouTubeAnalyticsDashboard")
+    spark_master = resolve_spark_master("local[*]")
+    if spark_master:
+        builder = builder.master(spark_master)
     return (
-        SparkSession.builder.appName("YouTubeAnalyticsDashboard")
-        .master("local[*]")
+        builder
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.jars", local_delta_jars_csv(PROJECT_ROOT))
         .config("spark.driver.memory", "4g")
         .config("spark.executor.memory", "4g")
-        .config("spark.jars.packages", MONGO_SPARK_PACKAGE)
         .getOrCreate()
     )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_optional_delta(collection: str, max_rows: int | None = None):
-    """Load an optional MongoDB collection into a pandas DataFrame. Name
-    is kept (`load_optional_delta`) to avoid touching all 9 callers — the
-    semantics are the same: 'return empty DF if the collection is missing
-    or empty.'"""
+    """Load an optional local Delta table into a pandas DataFrame."""
     try:
-        if not mongo_collection_has_data(collection):
+        if not os.path.exists(collection):
             return pd.DataFrame()
 
         spark = get_spark()
-        sdf = mongo_read(spark, collection)
+        sdf = spark.read.format("delta").load(collection)
 
         if sdf.limit(1).count() == 0:
             return pd.DataFrame()
@@ -703,11 +673,11 @@ def load_optional_delta(collection: str, max_rows: int | None = None):
 @st.cache_data(ttl=60, show_spinner=False)
 def load_silver_filtered(selected_category: str, selected_region: str, history_window: str):
     try:
-        if not mongo_collection_has_data(SILVER_DELTA_PATH):
+        if not os.path.exists(SILVER_DELTA_PATH):
             return pd.DataFrame(), False
 
         spark = get_spark()
-        sdf = mongo_read(spark, SILVER_DELTA_PATH)
+        sdf = spark.read.format("delta").load(SILVER_DELTA_PATH)
 
         if selected_category != "All":
             sdf = sdf.filter(col("category_name") == selected_category)
@@ -862,7 +832,7 @@ def load_spark_trending_rank_distribution(category_name, trending_region, histor
 def load_spark_kpis(category_name, trending_region, history_window):
     """Headline KPIs computed entirely in Spark (no pandas processing)."""
     spark = get_spark()
-    sdf = mongo_read(spark, SILVER_DELTA_PATH)
+    sdf = spark.read.format("delta").load(SILVER_DELTA_PATH)
     if category_name:
         sdf = sdf.filter(col("category_name") == category_name)
     if trending_region:
@@ -906,12 +876,12 @@ def load_filter_source():
         return gold_latest_snapshot_df
 
     try:
-        if not mongo_collection_has_data(SILVER_DELTA_PATH):
+        if not os.path.exists(SILVER_DELTA_PATH):
             return pd.DataFrame()
 
         spark = get_spark()
         sdf = (
-            mongo_read(spark, SILVER_DELTA_PATH)
+            spark.read.format("delta").load(SILVER_DELTA_PATH)
             .select("category_name", "trending_region")
             .dropna(subset=["category_name", "trending_region"])
             .distinct()
@@ -1239,7 +1209,6 @@ else:
 # arrays, so the legacy pandas-based builders remain for tab 2.
 video_forecast_df = build_view_count_forecast_v2(df)
 duration_prediction_df = build_trending_duration_prediction(df)
-peak_rank_forecast_df = build_peak_rank_forecast(df)
 category_share_forecast_df = build_category_share_forecast(df)
 
 
@@ -2197,66 +2166,8 @@ with tab2:
                 _suggest_from_duration_prediction(duration_row),
             )
 
-    st.subheader("Peak Rank and Category Forecasting")
-    st.markdown("These charts estimate the best future rank a current video may reach and the next category-share trajectory using the accumulated time-series history.")
-
-    if peak_rank_forecast_df.empty:
-        st.info("Peak-rank forecasting needs more historical trajectories first.")
-    else:
-        peak_rank_select = alt.selection_point(
-            name="peak_rank_select",
-            fields=["title"],
-            on="click",
-            toggle=False,
-            empty=False,
-        )
-        peak_rank_chart = (
-            alt.Chart(peak_rank_forecast_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("expected_rank_gain:Q", title="Expected Rank Improvement"),
-                y=alt.Y("title:N", sort="-x", title="Video"),
-                color=alt.Color("category_name:N", title="Category"),
-                opacity=alt.condition(peak_rank_select, alt.value(1), alt.value(0.4)),
-                tooltip=[
-                    "title",
-                    "category_name",
-                    "trending_region",
-                    "current_rank",
-                    alt.Tooltip("predicted_peak_rank:Q", title="Predicted Peak Rank", format=".1f"),
-                    alt.Tooltip("expected_rank_gain:Q", title="Expected Rank Gain", format=".1f"),
-                    alt.Tooltip("avg_rank_delta:Q", title="Avg Rank Delta", format=".2f"),
-                    alt.Tooltip("current_velocity:Q", title="Current Velocity", format=".2f"),
-                ],
-            )
-            .add_params(peak_rank_select)
-            .properties(height=450)
-        )
-        peak_rank_event = st.altair_chart(
-            peak_rank_chart,
-            width="stretch",
-            on_select="rerun",
-            selection_mode="peak_rank_select",
-            key="peak_rank_chart",
-        )
-        _model_metrics_strip(
-            "Peak Rank Forecast",
-            load_peak_rank_metrics(df),
-        )
-        peak_context = _extract_chart_selection(
-            peak_rank_event,
-            "peak_rank_select",
-            ["title"],
-        )
-        selected_peak_title = _normalize_context_value(peak_context.get("title"))
-        if selected_peak_title:
-            peak_row = peak_rank_forecast_df[
-                peak_rank_forecast_df["title"] == selected_peak_title
-            ].iloc[0]
-            _render_suggestion_box(
-                f"Suggestions for `{selected_peak_title}`",
-                _suggest_from_peak_rank_forecast(peak_row),
-            )
+    st.subheader("Category Forecasting")
+    st.markdown("This chart estimates the next category-share trajectory using the accumulated time-series history.")
 
     if category_share_forecast_df.empty:
         st.info("Category-share forecasting needs at least 2 time buckets per category.")

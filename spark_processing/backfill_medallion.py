@@ -15,6 +15,7 @@ from pyspark.sql.functions import current_timestamp, lit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analytics.mongo_io import MONGO_SPARK_PACKAGE, mongo_write
+from runtime_config import local_delta_jars_csv, resolve_spark_master
 from storage_paths import ensure_medallion_paths
 from transformations import build_silver_df, refresh_gold_tables
 
@@ -32,12 +33,15 @@ GOLD_COLLECTIONS = MEDALLION_PATHS["gold"]
 
 
 def _build_spark() -> SparkSession:
+    builder = SparkSession.builder.appName("YouTubeMedallionBackfill")
+    spark_master = resolve_spark_master("local[4]")
+    if spark_master:
+        builder = builder.master(spark_master)
+
     builder = (
-        SparkSession.builder.appName("YouTubeMedallionBackfill")
-        # Backfill is one-shot and CPU-bound on local disk + Mongo writes.
-        # Cap parallelism so each task has more heap.
-        .master("local[4]")
+        builder
         .config("spark.jars.packages", MONGO_SPARK_PACKAGE)
+        .config("spark.jars", local_delta_jars_csv(Path(__file__).resolve().parents[1]))
         # Heap headroom — backfill scans the whole Silver in one go, much
         # bigger than any streaming micro-batch.
         .config("spark.driver.memory", "8g")
@@ -51,17 +55,17 @@ def _build_spark() -> SparkSession:
         # tiny partitions waste task scheduling time.
         .config("spark.sql.shuffle.partitions", "16")
     )
-    # Delta JARs are only needed if we're migrating from a local Delta dump.
     if Path(SOURCE_DELTA_PATH).exists():
         builder = (
             builder
             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
             .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-            .config(
-                "spark.jars",
-                "jars/delta-core_2.12-2.4.0.jar,"
-                "jars/delta-storage-2.4.0.jar",
-            )
+        )
+    else:
+        builder = (
+            builder
+            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         )
     return builder.getOrCreate()
 
@@ -88,7 +92,7 @@ def main() -> None:
 
         print("[backfill] writing Silver ...")
         silver_df = build_silver_df(bronze_df)
-        mongo_write(silver_df, SILVER_COLLECTION, mode="append")
+        silver_df.write.format("delta").mode("append").save(SILVER_COLLECTION)
         print("[backfill] Bronze + Silver written.")
     else:
         print(
