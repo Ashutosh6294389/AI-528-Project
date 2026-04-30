@@ -657,36 +657,37 @@ def _explain_rank_channel_concentration_v2(df) -> str:
     )
 
 
+from analytics.mongo_io import (
+    MONGO_SPARK_PACKAGE,
+    mongo_collection_has_data,
+    mongo_read,
+)
+
+
 @st.cache_resource(show_spinner=False)
 def get_spark():
     return (
         SparkSession.builder.appName("YouTubeAnalyticsDashboard")
         .master("local[*]")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.driver.memory", "4g")
         .config("spark.executor.memory", "4g")
-        .config(
-            "spark.jars",
-            "jars/delta-core_2.12-2.4.0.jar,"
-            "jars/delta-storage-2.4.0.jar,"
-            "jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,"
-            "jars/spark-token-provider-kafka-0-10_2.12-3.4.1.jar,"
-            "jars/kafka-clients-3.4.1.jar,"
-            "jars/commons-pool2-2.11.1.jar",
-        )
+        .config("spark.jars.packages", MONGO_SPARK_PACKAGE)
         .getOrCreate()
     )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_optional_delta(path: str, max_rows: int | None = None):
+def load_optional_delta(collection: str, max_rows: int | None = None):
+    """Load an optional MongoDB collection into a pandas DataFrame. Name
+    is kept (`load_optional_delta`) to avoid touching all 9 callers — the
+    semantics are the same: 'return empty DF if the collection is missing
+    or empty.'"""
     try:
-        if not os.path.exists(path):
+        if not mongo_collection_has_data(collection):
             return pd.DataFrame()
 
         spark = get_spark()
-        sdf = spark.read.format("delta").load(path)
+        sdf = mongo_read(spark, collection)
 
         if sdf.limit(1).count() == 0:
             return pd.DataFrame()
@@ -702,11 +703,11 @@ def load_optional_delta(path: str, max_rows: int | None = None):
 @st.cache_data(ttl=60, show_spinner=False)
 def load_silver_filtered(selected_category: str, selected_region: str, history_window: str):
     try:
-        if not os.path.exists(SILVER_DELTA_PATH):
+        if not mongo_collection_has_data(SILVER_DELTA_PATH):
             return pd.DataFrame(), False
 
         spark = get_spark()
-        sdf = spark.read.format("delta").load(SILVER_DELTA_PATH)
+        sdf = mongo_read(spark, SILVER_DELTA_PATH)
 
         if selected_category != "All":
             sdf = sdf.filter(col("category_name") == selected_category)
@@ -861,7 +862,7 @@ def load_spark_trending_rank_distribution(category_name, trending_region, histor
 def load_spark_kpis(category_name, trending_region, history_window):
     """Headline KPIs computed entirely in Spark (no pandas processing)."""
     spark = get_spark()
-    sdf = spark.read.format("delta").load(SILVER_DELTA_PATH)
+    sdf = mongo_read(spark, SILVER_DELTA_PATH)
     if category_name:
         sdf = sdf.filter(col("category_name") == category_name)
     if trending_region:
@@ -905,12 +906,12 @@ def load_filter_source():
         return gold_latest_snapshot_df
 
     try:
-        if not os.path.exists(SILVER_DELTA_PATH):
+        if not mongo_collection_has_data(SILVER_DELTA_PATH):
             return pd.DataFrame()
 
         spark = get_spark()
         sdf = (
-            spark.read.format("delta").load(SILVER_DELTA_PATH)
+            mongo_read(spark, SILVER_DELTA_PATH)
             .select("category_name", "trending_region")
             .dropna(subset=["category_name", "trending_region"])
             .distinct()

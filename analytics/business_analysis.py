@@ -106,15 +106,18 @@ def prepare_dashboard_df(df: pd.DataFrame) -> pd.DataFrame:
     df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce", utc=True)
 
     df["engagements"] = df["like_count"] + df["comment_count"]
-    safe_views = df["view_count"].replace(0, pd.NA)
+    # Use np.nan (a float64 value) instead of pd.NA — pd.NA forces the
+    # Series to object dtype, which then trips pandas 2.2's deprecation
+    # warning on the .fillna(0) below.
+    safe_views = df["view_count"].replace(0, np.nan)
 
     df["like_rate"] = (df["like_count"] / safe_views).fillna(0)
     df["comment_rate"] = (df["comment_count"] / safe_views).fillna(0)
     df["engagement_rate"] = (df["engagements"] / safe_views).fillna(0)
 
-    df["like_rate"] = df["like_rate"].replace([float("inf"), -float("inf")], 0)
-    df["comment_rate"] = df["comment_rate"].replace([float("inf"), -float("inf")], 0)
-    df["engagement_rate"] = df["engagement_rate"].replace([float("inf"), -float("inf")], 0)
+    df["like_rate"] = df["like_rate"].replace([np.inf, -np.inf], 0)
+    df["comment_rate"] = df["comment_rate"].replace([np.inf, -np.inf], 0)
+    df["engagement_rate"] = df["engagement_rate"].replace([np.inf, -np.inf], 0)
 
     now_ts = pd.Timestamp.utcnow().tz_localize("UTC") if pd.Timestamp.utcnow().tzinfo is None else pd.Timestamp.utcnow()
     df["video_age_hours"] = (

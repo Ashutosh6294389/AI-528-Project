@@ -263,19 +263,52 @@ def build_gold_trending_rank_distribution(silver_df: DataFrame) -> DataFrame:
     )
 
 
-def refresh_gold_tables(spark: SparkSession, silver_path: str, gold_paths: dict[str, str]) -> None:
-    silver_df = spark.read.format("delta").load(silver_path)
-    latest_snapshot_df = build_gold_latest_snapshot(silver_df)
+def refresh_gold_tables(spark: SparkSession, silver_collection: str, gold_collections: dict[str, str]) -> None:
+    """Rebuild every Gold collection from Silver. Each call is an atomic
+    overwrite (the Spark MongoDB connector writes to a staging collection
+    and renames it), so dashboard reads never see a partially-rebuilt Gold.
 
-    build_gold_latest_snapshot(silver_df).write.format("delta").mode("overwrite").save(gold_paths["latest_snapshot"])
-    build_gold_category_summary(latest_snapshot_df).write.format("delta").mode("overwrite").save(gold_paths["category_summary"])
-    build_gold_views_timeseries(silver_df).write.format("delta").mode("overwrite").save(gold_paths["views_timeseries"])
-    build_gold_region_timeseries(silver_df).write.format("delta").mode("overwrite").save(gold_paths["region_timeseries"])
-    build_gold_channel_leaderboard(latest_snapshot_df).write.format("delta").mode("overwrite").save(gold_paths["channel_leaderboard"])
-    build_gold_duration_distribution(silver_df).write.format("delta").mode("overwrite").save(gold_paths["duration_distribution"])
-    build_gold_subscriber_tier_distribution(silver_df).write.format("delta").mode("overwrite").save(gold_paths["subscriber_tier_distribution"])
-    build_gold_tag_usage_frequency(silver_df).write.format("delta").mode("overwrite").save(gold_paths["tag_usage_frequency"])
-    build_gold_trending_rank_distribution(silver_df).write.format("delta").mode("overwrite").save(gold_paths["trending_rank_distribution"])
+    We cache Silver and the latest-snapshot frame so the network read +
+    snapshot computation happen once each, not 9× and 2× respectively.
+    Caching to disk (MEMORY_AND_DISK) is critical: Silver may not fit in
+    heap, but it always fits if it can spill.
+    """
+    from analytics.mongo_io import mongo_read, mongo_write
+    from pyspark import StorageLevel
+
+    # DISK_ONLY (NOT MEMORY_AND_DISK): the in-memory columnar cache that
+    # MEMORY_AND_DISK builds first goes through CompressibleColumnBuilder,
+    # which accumulates a whole column batch in heap before deciding to
+    # spill — and that builder is what OOMs on a large Silver. DISK_ONLY
+    # serialises rows straight to disk and never builds the columnar
+    # cache. Slightly slower per read, but it never blows the heap.
+    silver_df = mongo_read(spark, silver_collection).persist(StorageLevel.DISK_ONLY)
+    try:
+        latest_snapshot_df = build_gold_latest_snapshot(silver_df).persist(
+            StorageLevel.DISK_ONLY
+        )
+        try:
+            mongo_write(latest_snapshot_df, gold_collections["latest_snapshot"], mode="overwrite")
+            mongo_write(build_gold_category_summary(latest_snapshot_df), gold_collections["category_summary"], mode="overwrite")
+            mongo_write(build_gold_channel_leaderboard(latest_snapshot_df), gold_collections["channel_leaderboard"], mode="overwrite")
+
+            mongo_write(build_gold_views_timeseries(silver_df), gold_collections["views_timeseries"], mode="overwrite")
+            mongo_write(build_gold_region_timeseries(silver_df), gold_collections["region_timeseries"], mode="overwrite")
+            mongo_write(build_gold_duration_distribution(silver_df), gold_collections["duration_distribution"], mode="overwrite")
+            mongo_write(build_gold_subscriber_tier_distribution(silver_df), gold_collections["subscriber_tier_distribution"], mode="overwrite")
+            mongo_write(build_gold_tag_usage_frequency(silver_df), gold_collections["tag_usage_frequency"], mode="overwrite")
+            mongo_write(build_gold_trending_rank_distribution(silver_df), gold_collections["trending_rank_distribution"], mode="overwrite")
+        finally:
+            try:
+                latest_snapshot_df.unpersist()
+            except Exception:
+                # SparkContext may already be torn down on failure paths.
+                pass
+    finally:
+        try:
+            silver_df.unpersist()
+        except Exception:
+            pass
 
 
 def duration_to_seconds_expr(column_name: str):

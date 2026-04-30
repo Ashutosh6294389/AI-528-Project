@@ -1,5 +1,6 @@
 pyspark==3.4.1
-delta-spark==2.4.0
+delta-spark==2.4.0           # only used by the optional one-shot Delta -> Mongo backfill
+pymongo==4.7.2               # Mongo client for index/TTL setup + cheap existence probes
 kafka-python==2.0.2
 streamlit==1.44.1
 altair==5.5.0

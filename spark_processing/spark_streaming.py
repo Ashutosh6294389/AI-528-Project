@@ -1,3 +1,7 @@
+import os
+import sys
+from pathlib import Path
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, current_timestamp, from_json, lit
 from pyspark.sql.types import (
@@ -8,6 +12,10 @@ from pyspark.sql.types import (
     StructType,
 )
 
+# Make sibling packages importable when this script is run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from analytics.mongo_io import MONGO_SPARK_PACKAGE, mongo_write
 from storage_paths import ensure_medallion_paths
 from transformations import build_silver_df, refresh_gold_tables
 
@@ -15,29 +23,42 @@ from transformations import build_silver_df, refresh_gold_tables
 KAFKA_BROKER = "localhost:9092"
 TOPIC = "youtube-data"
 MEDALLION_PATHS = ensure_medallion_paths()
-BRONZE_PATH = MEDALLION_PATHS["bronze"]
-SILVER_PATH = MEDALLION_PATHS["silver"]
-GOLD_PATHS = MEDALLION_PATHS["gold"]
+BRONZE_COLLECTION = MEDALLION_PATHS["bronze"]
+SILVER_COLLECTION = MEDALLION_PATHS["silver"]
+GOLD_COLLECTIONS = MEDALLION_PATHS["gold"]
 CHECKPOINT_PATH = MEDALLION_PATHS["checkpoint"]
 
 
 spark = (
     SparkSession.builder.appName("YouTubeMedallionStreaming")
     .master("local[*]")
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-    .config("spark.databricks.delta.schema.autoMerge.enabled", "true")
+    # The MongoDB connector is fetched via Maven on first run; the Kafka
+    # JARs are still loaded from the local jars/ folder.
+    .config("spark.jars.packages", MONGO_SPARK_PACKAGE)
     .config(
         "spark.jars",
-        "jars/delta-core_2.12-2.4.0.jar,"
-        "jars/delta-storage-2.4.0.jar,"
         "jars/spark-sql-kafka-0-10_2.12-3.4.1.jar,"
         "jars/spark-token-provider-kafka-0-10_2.12-3.4.1.jar,"
         "jars/kafka-clients-3.4.1.jar,"
         "jars/commons-pool2-2.11.1.jar",
     )
+    # Heap sizing — Gold refresh scans the entire Silver collection, so
+    # the driver/executor needs enough RAM to hold a partition of BSON
+    # documents while the connector decodes them.
+    .config("spark.driver.memory", "4g")
+    .config("spark.executor.memory", "4g")
+    .config("spark.driver.maxResultSize", "2g")
+    # Smaller Mongo read partitions = smaller per-task working set when
+    # the connector deserializes a cursor batch.
+    .config("spark.mongodb.read.partitionerOptions.partitionSizeMB", "32")
     .getOrCreate()
 )
+
+# How often Gold gets rebuilt — on every Nth micro-batch instead of every
+# batch. Default 5 ≈ 3-4 minutes between Gold refreshes at the streaming
+# cadence, which keeps the dashboard fresh without a full Silver scan
+# every 45 seconds.
+GOLD_REFRESH_EVERY_N_BATCHES = int(os.environ.get("GOLD_REFRESH_EVERY", "5"))
 
 spark.sparkContext.setLogLevel("WARN")
 
@@ -89,15 +110,30 @@ def process_batch(batch_df, batch_id: int) -> None:
         .persist()
     )
 
-    parsed_batch.write.format("delta").mode("append").save(BRONZE_PATH)
+    # Bronze: raw documents land in MongoDB exactly as they came off Kafka,
+    # with our ingestion metadata. The TTL index on `ingestion_timestamp`
+    # auto-expires old records (configurable via BRONZE_TTL_DAYS).
+    mongo_write(parsed_batch, BRONZE_COLLECTION, mode="append")
 
+    # Silver: enriched + typed documents — `tags_array` is stored as a
+    # native BSON array, no flattening at write time.
     silver_batch = build_silver_df(parsed_batch)
-    silver_batch.write.format("delta").mode("append").option("mergeSchema", "true").save(SILVER_PATH)
+    mongo_write(silver_batch, SILVER_COLLECTION, mode="append")
 
-    refresh_gold_tables(spark, SILVER_PATH, GOLD_PATHS)
+    # Gold: nine aggregated collections rebuilt atomically from Silver.
+    # Skipped on most batches — Gold scanning the full Silver every 45 s
+    # is wasteful as Silver grows. Refresh every Nth batch instead.
+    if (batch_id % GOLD_REFRESH_EVERY_N_BATCHES) == 0:
+        refresh_gold_tables(spark, SILVER_COLLECTION, GOLD_COLLECTIONS)
+        gold_msg = "gold refreshed"
+    else:
+        gold_msg = (
+            f"gold skipped ({batch_id % GOLD_REFRESH_EVERY_N_BATCHES}"
+            f"/{GOLD_REFRESH_EVERY_N_BATCHES} until next refresh)"
+        )
 
     parsed_batch.unpersist()
-    print(f"Processed batch {batch_id}: bronze appended, silver refreshed, gold refreshed.")
+    print(f"Processed batch {batch_id}: bronze appended, silver appended, {gold_msg}.")
 
 
 kafka_df = (
@@ -121,5 +157,9 @@ query = (
     .start()
 )
 
-print("Spark streaming started. Writing to persistent Bronze/Silver/Gold Delta tables...")
+print(
+    "Spark streaming started. Writing Bronze/Silver/Gold to MongoDB at "
+    f"{__import__('analytics.mongo_io', fromlist=['MONGO_URI']).MONGO_URI} / "
+    f"{__import__('analytics.mongo_io', fromlist=['MONGO_DB']).MONGO_DB}"
+)
 query.awaitTermination()
